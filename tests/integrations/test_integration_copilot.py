@@ -125,9 +125,9 @@ class TestCopilotIntegration:
         agents_dir = tmp_path / ".github" / "agents"
         assert agents_dir.is_dir()
         agent_files = sorted(agents_dir.glob("speckit.*.agent.md"))
-        assert len(agent_files) == 9
+        assert len(agent_files) == 11
         expected_commands = {
-            "analyze", "checklist", "clarify", "constitution",
+            "analyze", "analyzebatch", "checklist", "clarify", "clarifybatch", "constitution",
             "implement", "plan", "specify", "tasks", "taskstoissues",
         }
         actual_commands = {f.name.removeprefix("speckit.").removesuffix(".agent.md") for f in agent_files}
@@ -179,8 +179,10 @@ class TestCopilotIntegration:
         actual = sorted(p.relative_to(project).as_posix() for p in project.rglob("*") if p.is_file())
         expected = sorted([
             ".github/agents/speckit.analyze.agent.md",
+            ".github/agents/speckit.analyzebatch.agent.md",
             ".github/agents/speckit.checklist.agent.md",
             ".github/agents/speckit.clarify.agent.md",
+            ".github/agents/speckit.clarifybatch.agent.md",
             ".github/agents/speckit.constitution.agent.md",
             ".github/agents/speckit.implement.agent.md",
             ".github/agents/speckit.plan.agent.md",
@@ -188,8 +190,10 @@ class TestCopilotIntegration:
             ".github/agents/speckit.tasks.agent.md",
             ".github/agents/speckit.taskstoissues.agent.md",
             ".github/prompts/speckit.analyze.prompt.md",
+            ".github/prompts/speckit.analyzebatch.prompt.md",
             ".github/prompts/speckit.checklist.prompt.md",
             ".github/prompts/speckit.clarify.prompt.md",
+            ".github/prompts/speckit.clarifybatch.prompt.md",
             ".github/prompts/speckit.constitution.prompt.md",
             ".github/prompts/speckit.implement.prompt.md",
             ".github/prompts/speckit.plan.prompt.md",
@@ -239,8 +243,10 @@ class TestCopilotIntegration:
         actual = sorted(p.relative_to(project).as_posix() for p in project.rglob("*") if p.is_file())
         expected = sorted([
             ".github/agents/speckit.analyze.agent.md",
+            ".github/agents/speckit.analyzebatch.agent.md",
             ".github/agents/speckit.checklist.agent.md",
             ".github/agents/speckit.clarify.agent.md",
+            ".github/agents/speckit.clarifybatch.agent.md",
             ".github/agents/speckit.constitution.agent.md",
             ".github/agents/speckit.implement.agent.md",
             ".github/agents/speckit.plan.agent.md",
@@ -248,8 +254,10 @@ class TestCopilotIntegration:
             ".github/agents/speckit.tasks.agent.md",
             ".github/agents/speckit.taskstoissues.agent.md",
             ".github/prompts/speckit.analyze.prompt.md",
+            ".github/prompts/speckit.analyzebatch.prompt.md",
             ".github/prompts/speckit.checklist.prompt.md",
             ".github/prompts/speckit.clarify.prompt.md",
+            ".github/prompts/speckit.clarifybatch.prompt.md",
             ".github/prompts/speckit.constitution.prompt.md",
             ".github/prompts/speckit.implement.prompt.md",
             ".github/prompts/speckit.plan.prompt.md",
@@ -286,7 +294,7 @@ class TestCopilotSkillsMode:
     """Tests for Copilot integration in --skills mode."""
 
     _SKILL_COMMANDS = [
-        "analyze", "checklist", "clarify", "constitution",
+        "analyze", "analyzebatch", "checklist", "clarify", "clarifybatch", "constitution",
         "implement", "plan", "specify", "tasks", "taskstoissues",
     ]
 

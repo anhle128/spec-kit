@@ -2,6 +2,12 @@
 
 <!-- insert new changelog below this comment -->
 
+## [Unreleased]
+
+### Added
+
+- feat(commands): add `/speckit-analyzebatch` — file-centric DRAFT → APPLY pair for cross-artifact analysis. Mirror of `/speckit-clarifybatch` for analyze. Generates `analyze-findings-<date>.md` with `Status: PENDING`, then `--apply` reads filled resolutions (`spec-fix` / `new-OQ` / `accepted-risk` / `out-of-scope` / `skipped`) and atomically applies them to spec.md / plan.md / tasks.md using a literal-substring `Before:` / `After:` contract for deterministic, audit-replayable edits. Coexists with the existing read-only `/speckit-analyze`.
+
 ## [0.8.4] - 2026-05-01
 
 ### Changed

@@ -363,8 +363,10 @@ class YamlIntegrationTests:
 
     COMMAND_STEMS = [
         "analyze",
+        "analyzebatch",
         "checklist",
         "clarify",
+        "clarifybatch",
         "constitution",
         "implement",
         "plan",
