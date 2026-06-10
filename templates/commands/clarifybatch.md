@@ -182,9 +182,21 @@ For each category with Partial or Missing status, add a candidate question oppor
 - Clarification would not materially change implementation or validation strategy
 - Information is better deferred to planning phase (note internally)
 
-<!-- VERBATIM from templates/commands/clarify.md (prioritization heuristic, lines 125-134). Keep in sync. -->
+Before any candidate becomes a user-facing question, run this repo-first source-of-truth gate:
 
-Generate (internally) a prioritized queue of candidate clarification questions (maximum `MAX_QUESTIONS`). Apply these constraints:
+- Classify the candidate as one of:
+  - **Existing behavior**: asks what the current product/code already does, how an implemented rule works, what formats/limits/states exist, which integration is used, or what error/failure behavior already ships.
+  - **Product/policy decision**: asks what behavior should be chosen where no current implementation or documented policy decides it.
+  - **Migration decision**: asks whether/how to change existing behavior, data, compatibility, rollout, or user expectations.
+- If the candidate is about **existing behavior**, inspect the repository before asking the user. Use targeted searches and reads of likely source-of-truth files such as implementation code, config, schemas, migrations, tests, API contracts, fixtures, and existing docs in the active feature area.
+- If a question can be answered by exploring the codebase, explore the codebase instead. If code determines the answer, do **not** include the question in the user-facing queue; record it as a source-derived answer with evidence.
+- Evidence MUST cite concrete repo locations (`path:line` when possible, or `path` plus the symbol/setting/test name if line numbers are unavailable). Prefer implementation or contract evidence over tests; use tests as corroborating evidence when implementation is indirect.
+- If source evidence conflicts, is stale, or only partially answers the question, keep it as a user-facing question and include the conflict/partial evidence in the rationale.
+- Only ask the user for unresolved product/policy decisions or migration decisions that repo inspection cannot decide.
+
+<!-- Adapted from templates/commands/clarify.md (prioritization heuristic, lines 125-134); repo-first filtering added. Keep in sync intentionally. -->
+
+Generate (internally) a prioritized queue of unresolved user-facing clarification questions (maximum `MAX_QUESTIONS`) after the repo-first source-of-truth gate. Apply these constraints:
 
 - Maximum of `MAX_QUESTIONS` total questions across the whole session (default 5; user-overridable via `--turn=N` / `--turn N`, range 1–20).
 - Each question must be answerable with EITHER:
@@ -192,11 +204,13 @@ Generate (internally) a prioritized queue of candidate clarification questions (
   - A one-word / short‑phrase answer (explicitly constrain: "Answer in <=5 words").
 - Only include questions whose answers materially impact architecture, data modeling, task decomposition, test design, UX behavior, operational readiness, or compliance validation.
 - Ensure category coverage balance: attempt to cover the highest impact unresolved categories first; avoid asking two low-impact questions when a single high-impact area (e.g., security posture) is unresolved.
-- Exclude questions already answered, trivial stylistic preferences, or plan-level execution details (unless blocking correctness).
+- Exclude questions already answered by the spec, source-derived answers, trivial stylistic preferences, or plan-level execution details (unless blocking correctness).
 - Favor clarifications that reduce downstream rework risk or prevent misaligned acceptance tests.
 - If more than `MAX_QUESTIONS` categories remain unresolved, select the top `MAX_QUESTIONS` by (Impact * Uncertainty) heuristic.
 
-**If the queue is empty** → respond: "No critical ambiguities detected worth formal clarification." and suggest proceeding to `__SPECKIT_COMMAND_PLAN__`. Do NOT create `QUESTIONS_FILE`. Skip directly to the post-execution hook section.
+**If both the source-derived answer list and the user-facing queue are empty** → respond: "No critical ambiguities detected worth formal clarification." and suggest proceeding to `__SPECKIT_COMMAND_PLAN__`. Do NOT create `QUESTIONS_FILE`. Skip directly to the post-execution hook section.
+
+**If the user-facing queue is empty but source-derived answers exist** → still create `QUESTIONS_FILE` with only the `Answered From Source` section below. Do NOT create empty Q-block placeholders.
 
 For each queued question, generate the recommended/suggested answer using the rules below.
 
@@ -228,7 +242,7 @@ For short‑answer style (no meaningful discrete options):
 - Format as: `**Suggested:** <your proposed answer> - <brief reasoning>`
 - Note: in batch mode the answer format constraint is `Short answer (<=5 words)`.
 
-**Now render the entire queue to `QUESTIONS_FILE`** using the following exact template. Render exactly N Q-blocks where N = number of queued questions (≤ `MAX_QUESTIONS`):
+**Now render the source-derived answers and entire user-facing queue to `QUESTIONS_FILE`** using the following exact template. Render zero or more source-derived answer items, then exactly N Q-blocks where N = number of queued user-facing questions (≤ `MAX_QUESTIONS`):
 
 ```markdown
 # Clarifications — <feature title from spec.md, or `FEATURE_DIR` basename if title missing>
@@ -242,7 +256,18 @@ For short‑answer style (no meaningful discrete options):
 - Edit each `Your Answer:` line below.
 - Type an option letter (A/B/C/...), or `recommended` / `yes` / `suggested` to accept the suggestion, or your own short answer (<=5 words).
 - Leave the line blank to skip a question.
+- Entries under `Answered From Source` are already resolved from repository evidence and do not need editing.
 - Save the file, then re-run `/clarifybatch` (or `/clarifybatch --apply`) to apply all answers in one pass.
+
+---
+
+## Answered From Source
+
+### S1. <question text>
+
+**Category:** <one of the 10 taxonomy categories above>
+**Answer:** <concise answer derived from source>
+**Evidence:** <path:line[, path:line...]>
 
 ---
 
@@ -269,6 +294,9 @@ For short‑answer style (no meaningful discrete options):
 
 Notes when rendering:
 
+- Omit the `## Answered From Source` section entirely when there are no source-derived answers.
+- Source-derived answers do not consume `MAX_QUESTIONS`; the quota applies only to user-facing Q-blocks.
+- Every source-derived answer MUST include `Question`, `Answer`, `Evidence`, and `Category` information in the structure shown above.
 - Always include the `Your Answer:` line with a single trailing space and no value (the user fills it).
 - For pure short-answer questions (no MC table), omit the table entirely and replace the `**Recommended:**` line with `**Suggested:** <answer> - <reasoning>`.
 - Include the `Short` table row only when a free-form alternative is meaningful for the question.
@@ -276,7 +304,8 @@ Notes when rendering:
 **After writing `QUESTIONS_FILE`**: report to the user:
 
 - Path to `QUESTIONS_FILE`.
-- Number of questions written + categories covered.
+- Number of source-derived answers, number of user-facing questions written, and categories covered.
+- A short source evidence summary for each source-derived answer.
 - A reminder: "Edit `Your Answer:` lines, save, then re-run `/clarifybatch` (or with `--apply`) to merge into spec.md."
 - Suggested next command: `/clarifybatch` (or `/clarifybatch --apply`) once the file is filled.
 
@@ -284,7 +313,18 @@ Do **NOT** modify `spec.md`. Do **NOT** continue to APPLY in the same run. Skip 
 
 ### Step 4 — APPLY phase
 
-Parse `QUESTIONS_FILE`. For each `## Q<N>.` block extract:
+Parse `QUESTIONS_FILE`.
+
+For each `## Answered From Source` entry (`### S<N>.`) extract:
+
+- the question text (the `### S<N>.` line),
+- the `Category:` value,
+- the `Answer:` value,
+- the `Evidence:` value.
+
+Treat source-derived entries as already resolved answers. They do not require a `Your Answer:` line and do not count against `MAX_QUESTIONS`, but they MUST include non-empty evidence before they can be applied. If evidence is missing, skip that source entry as "Skipped — missing evidence".
+
+For each `## Q<N>.` block extract:
 
 - the question text (the `## Q<N>.` line),
 - the `Category:` value,
@@ -300,7 +340,7 @@ Resolve each `Your Answer:` value:
 - If equal to `yes`, `recommended`, or `suggested` (case-insensitive) → use the previously stated `Recommended:` / `Suggested:` answer.
 - Otherwise, validate the answer maps to one option letter (A/B/C/D/E) or fits the <=5 word constraint.
 - If ambiguous (e.g. multiple letters, free text >5 words) → mark as "Skipped — ambiguous answer" and continue (do NOT prompt the user; this is batch mode).
-- Once satisfactory, record it in working memory.
+- Once satisfactory, record it in working memory as a user-provided resolved answer.
 
 Load `spec.md` once into memory.
 
@@ -311,9 +351,11 @@ For the first integrated answer in this batch:
 - Ensure a `## Clarifications` section exists in the in-memory spec (create it just after the highest-level contextual/overview section per the spec template if missing).
 - Under it, create (if not present) a `### Session YYYY-MM-DD` subheading for today.
 
-For each resolved (non-skipped) answer, in order:
+For each resolved (non-skipped) answer, in file order (source-derived answers first, then user-provided answers):
 
-- Append a bullet line under the Session subheading: `- Q: <question> → A: <final answer>`.
+- Append a bullet line under the Session subheading:
+  - Source-derived answer: `- Q: <question> → A: <final answer> (source: <evidence>)`
+  - User-provided answer: `- Q: <question> → A: <final answer>`
 - Then immediately apply the clarification to the most appropriate section(s) of the in-memory spec:
   - Functional ambiguity → Update or add a bullet in Functional Requirements.
   - User interaction / actor distinction → Update User Stories or Actors subsection (if present) with clarified role, constraint, or scenario.
@@ -327,12 +369,13 @@ For each resolved (non-skipped) answer, in order:
 
 **Batch write cadence (differs from `/clarify`'s per-answer write):** apply ALL parsed answers to the in-memory spec first, then perform validation, then write `spec.md` ONCE atomically. Do NOT save the file between answers.
 
-<!-- VERBATIM from templates/commands/clarify.md (validation rules, lines 190-196). Keep in sync. -->
+<!-- Adapted from templates/commands/clarify.md (validation rules, lines 190-196); source-derived answer checks added. Keep in sync intentionally. -->
 
 Validation (performed on the in-memory spec before the final write):
 
-- Clarifications session contains exactly one bullet per accepted answer (no duplicates).
-- Total accepted (non-skipped) answers ≤ `MAX_QUESTIONS`.
+- Clarifications session contains exactly one bullet per accepted source-derived or user-provided answer (no duplicates).
+- Total accepted user-provided answers ≤ `MAX_QUESTIONS`; source-derived answers do not count against the quota.
+- Every accepted source-derived answer has evidence recorded in the Clarifications bullet.
 - Updated sections contain no lingering vague placeholders the new answer was meant to resolve.
 - No contradictory earlier statement remains (scan for now-invalid alternative choices removed).
 - Markdown structure valid; only allowed new headings: `## Clarifications`, `### Session YYYY-MM-DD`.
@@ -350,7 +393,7 @@ Write the updated spec back to `FEATURE_SPEC` (single atomic write).
 
 Report completion:
 
-- Number of questions accepted (applied) + number skipped (outstanding/ambiguous) + total in file.
+- Number of source-derived answers applied + number of user answers applied + number skipped (outstanding/ambiguous/missing evidence) + total user-facing questions in file.
 - Path to updated spec.
 - Sections touched (list names).
 - Path to the archived questions file.
@@ -367,6 +410,8 @@ Report completion:
 - If no meaningful ambiguities found (or all potential questions would be low-impact), respond: "No critical ambiguities detected worth formal clarification." and suggest proceeding.
 - If spec file missing, instruct user to run `__SPECKIT_COMMAND_SPECIFY__` first (do not create a new spec here).
 - Never exceed `MAX_QUESTIONS` total questions (defaults to 5; configurable via `--turn=N` / `--turn N`, range 1–20).
+- Do not ask users questions about existing behavior until targeted repo/source-of-truth inspection has failed to answer them.
+- If repo/source-of-truth inspection answers an existing-behavior question, record the answer and evidence in `Answered From Source` instead of asking the user.
 - Avoid speculative tech stack questions unless the absence blocks functional clarity.
 - Early termination signals ("stop", "done", "proceed") are no-ops — `clarifybatch` has no per-turn loop. For interactive early-stop semantics, use `__SPECKIT_COMMAND_CLARIFY__`.
 - If no questions asked due to full coverage, output a compact coverage summary (all categories Clear) then suggest advancing.
