@@ -31,10 +31,6 @@ class TestGenericIntegration:
         i = get_integration("generic")
         assert i.config["requires_cli"] is False
 
-    def test_context_file_is_agents_md(self):
-        i = get_integration("generic")
-        assert i.context_file == "AGENTS.md"
-
     # -- Options ----------------------------------------------------------
 
     def test_options_include_commands_dir(self):
@@ -161,69 +157,100 @@ class TestGenericIntegration:
 
     # -- Context section ---------------------------------------------------
 
-    def test_setup_upserts_context_section(self, tmp_path):
+    def test_setup_does_not_write_context_section(self, tmp_path):
         i = get_integration("generic")
         m = IntegrationManifest("generic", tmp_path)
         i.setup(tmp_path, m, parsed_options={"commands_dir": ".custom/cmds"})
-        if i.context_file:
-            ctx_path = tmp_path / i.context_file
-            assert ctx_path.exists()
-            content = ctx_path.read_text(encoding="utf-8")
-            assert "<!-- SPECKIT START -->" in content
-            assert "<!-- SPECKIT END -->" in content
+        for path in tmp_path.rglob("*"):
+            if path.is_file():
+                text = path.read_text(encoding="utf-8", errors="ignore")
+                assert "<!-- SPECKIT START -->" not in text
 
-    def test_plan_references_correct_context_file(self, tmp_path):
-        """The generated plan command must reference generic's context file."""
+    def test_plan_command_has_no_context_placeholder(self, tmp_path):
+        """The core plan command must not carry a context-file placeholder —
+        agent context files are owned by the opt-in agent-context extension."""
         i = get_integration("generic")
         m = IntegrationManifest("generic", tmp_path)
         i.setup(tmp_path, m, parsed_options={"commands_dir": ".custom/cmds"})
         plan_file = tmp_path / ".custom" / "cmds" / "speckit.plan.md"
         assert plan_file.exists()
         content = plan_file.read_text(encoding="utf-8")
-        assert i.context_file in content, (
-            f"Plan command should reference {i.context_file!r}"
-        )
         assert "__CONTEXT_FILE__" not in content
+
+    def test_plan_defines_quickstart_as_validation_guide(self, tmp_path):
+        """The generated plan command should keep quickstart.md out of implementation scope."""
+        i = get_integration("generic")
+        m = IntegrationManifest("generic", tmp_path)
+        i.setup(tmp_path, m, parsed_options={"commands_dir": ".custom/cmds"})
+        plan_file = tmp_path / ".custom" / "cmds" / "speckit.plan.md"
+        assert plan_file.exists()
+        content = plan_file.read_text(encoding="utf-8")
+
+        assert "Create quickstart validation guide" in content
+        assert "runnable validation scenarios" in content
+        assert "Do not include full implementation code" in content
+        assert "implementation details belong in `tasks.md` and the implementation phase" in content
+
+    def test_implement_loads_constitution_context(self, tmp_path):
+        """The generated implement command should load constitution governance context."""
+        i = get_integration("generic")
+        m = IntegrationManifest("generic", tmp_path)
+        i.setup(tmp_path, m, parsed_options={"commands_dir": ".custom/cmds"})
+        implement_file = tmp_path / ".custom" / "cmds" / "speckit.implement.md"
+        assert implement_file.exists()
+        content = implement_file.read_text(encoding="utf-8")
+        assert ".specify/memory/constitution.md" in content
+
+    @pytest.mark.parametrize(
+        "command_stem",
+        [
+            "analyze",
+            "clarify",
+            "converge",
+            "implement",
+            "plan",
+            "checklist",
+            "specify",
+            "tasks",
+            "taskstoissues",
+        ],
+    )
+    def test_command_loads_constitution_context(self, tmp_path, command_stem):
+        """Every command except constitution must reference constitution.md."""
+        i = get_integration("generic")
+        m = IntegrationManifest("generic", tmp_path)
+        i.setup(tmp_path, m, parsed_options={"commands_dir": ".custom/cmds"})
+        cmd_file = tmp_path / ".custom" / "cmds" / f"speckit.{command_stem}.md"
+        assert cmd_file.exists(), f"Command file missing: {cmd_file.name}"
+        content = cmd_file.read_text(encoding="utf-8")
+        assert "constitution.md" in content, (
+            f"speckit.{command_stem}.md must reference constitution.md"
+        )
+
+    def test_constitution_command_exists(self, tmp_path):
+        """The constitution command itself must exist but is not required to load itself."""
+        i = get_integration("generic")
+        m = IntegrationManifest("generic", tmp_path)
+        i.setup(tmp_path, m, parsed_options={"commands_dir": ".custom/cmds"})
+        cmd_file = tmp_path / ".custom" / "cmds" / "speckit.constitution.md"
+        assert cmd_file.exists()
 
     # -- CLI --------------------------------------------------------------
 
     def test_cli_generic_without_commands_dir_fails(self, tmp_path):
-        """--integration generic without --ai-commands-dir should fail."""
+        """--integration generic without --integration-options should fail."""
         from typer.testing import CliRunner
         from specify_cli import app
         runner = CliRunner()
         result = runner.invoke(app, [
             "init", str(tmp_path / "test-generic"), "--integration", "generic",
-            "--script", "sh", "--no-git",
         ])
-        # Generic requires --commands-dir / --ai-commands-dir
-        # The integration path validates via setup()
+        # Generic requires --commands-dir via --integration-options
         assert result.exit_code != 0
 
-    def test_init_options_includes_context_file(self, tmp_path):
-        """init-options.json must include context_file for the generic integration."""
-        import json
-        from typer.testing import CliRunner
-        from specify_cli import app
-
-        project = tmp_path / "opts-generic"
-        project.mkdir()
-        old_cwd = os.getcwd()
-        try:
-            os.chdir(project)
-            result = CliRunner().invoke(app, [
-                "init", "--here", "--integration", "generic",
-                "--ai-commands-dir", ".myagent/commands",
-                "--script", "sh", "--no-git",
-            ], catch_exceptions=False)
-        finally:
-            os.chdir(old_cwd)
-        assert result.exit_code == 0
-        opts = json.loads((project / ".specify" / "init-options.json").read_text())
-        assert opts.get("context_file") == "AGENTS.md"
 
     def test_complete_file_inventory_sh(self, tmp_path):
-        """Every file produced by specify init --integration generic --ai-commands-dir ... --script sh."""
+        """Every file produced by specify init --integration generic --integration-options=--commands-dir ... --script sh."""
         from typer.testing import CliRunner
         from specify_cli import app
 
@@ -234,24 +261,24 @@ class TestGenericIntegration:
             os.chdir(project)
             result = CliRunner().invoke(app, [
                 "init", "--here", "--integration", "generic",
-                "--ai-commands-dir", ".myagent/commands",
-                "--script", "sh", "--no-git",
+                "--integration-options=--commands-dir .myagent/commands",
+                "--script", "sh",
             ], catch_exceptions=False)
         finally:
             os.chdir(old_cwd)
         assert result.exit_code == 0, f"init failed: {result.output}"
         actual = sorted(
             p.relative_to(project).as_posix()
-            for p in project.rglob("*") if p.is_file()
+            for p in project.rglob("*") if p.is_file() and ".git" not in p.parts
         )
         expected = sorted([
-            "AGENTS.md",
             ".myagent/commands/speckit.analyze.md",
             ".myagent/commands/speckit.analyzebatch.md",
             ".myagent/commands/speckit.checklist.md",
             ".myagent/commands/speckit.clarify.md",
             ".myagent/commands/speckit.clarifybatch.md",
             ".myagent/commands/speckit.constitution.md",
+            ".myagent/commands/speckit.converge.md",
             ".myagent/commands/speckit.implement.md",
             ".myagent/commands/speckit.plan.md",
             ".myagent/commands/speckit.specify.md",
@@ -261,6 +288,7 @@ class TestGenericIntegration:
             ".specify/integration.json",
             ".specify/integrations/generic.manifest.json",
             ".specify/integrations/speckit.manifest.json",
+            ".specify/memory/.constitution-template.json",
             ".specify/memory/constitution.md",
             ".specify/scripts/bash/check-prerequisites.sh",
             ".specify/scripts/bash/common.sh",
@@ -281,7 +309,7 @@ class TestGenericIntegration:
         )
 
     def test_complete_file_inventory_ps(self, tmp_path):
-        """Every file produced by specify init --integration generic --ai-commands-dir ... --script ps."""
+        """Every file produced by specify init --integration generic --integration-options=--commands-dir ... --script ps."""
         from typer.testing import CliRunner
         from specify_cli import app
 
@@ -292,24 +320,24 @@ class TestGenericIntegration:
             os.chdir(project)
             result = CliRunner().invoke(app, [
                 "init", "--here", "--integration", "generic",
-                "--ai-commands-dir", ".myagent/commands",
-                "--script", "ps", "--no-git",
+                "--integration-options=--commands-dir .myagent/commands",
+                "--script", "ps",
             ], catch_exceptions=False)
         finally:
             os.chdir(old_cwd)
         assert result.exit_code == 0, f"init failed: {result.output}"
         actual = sorted(
             p.relative_to(project).as_posix()
-            for p in project.rglob("*") if p.is_file()
+            for p in project.rglob("*") if p.is_file() and ".git" not in p.parts
         )
         expected = sorted([
-            "AGENTS.md",
             ".myagent/commands/speckit.analyze.md",
             ".myagent/commands/speckit.analyzebatch.md",
             ".myagent/commands/speckit.checklist.md",
             ".myagent/commands/speckit.clarify.md",
             ".myagent/commands/speckit.clarifybatch.md",
             ".myagent/commands/speckit.constitution.md",
+            ".myagent/commands/speckit.converge.md",
             ".myagent/commands/speckit.implement.md",
             ".myagent/commands/speckit.plan.md",
             ".myagent/commands/speckit.specify.md",
@@ -319,6 +347,7 @@ class TestGenericIntegration:
             ".specify/integration.json",
             ".specify/integrations/generic.manifest.json",
             ".specify/integrations/speckit.manifest.json",
+            ".specify/memory/.constitution-template.json",
             ".specify/memory/constitution.md",
             ".specify/scripts/powershell/check-prerequisites.ps1",
             ".specify/scripts/powershell/common.ps1",

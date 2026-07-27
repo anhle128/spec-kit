@@ -6,6 +6,8 @@ import os
 import pytest
 import yaml
 
+from tests.http_helpers import route_opener_open_through_urlopen  # noqa: F401
+
 from specify_cli.integrations.catalog import (
     IntegrationCatalog,
     IntegrationCatalogEntry,
@@ -13,7 +15,32 @@ from specify_cli.integrations.catalog import (
     IntegrationDescriptor,
     IntegrationDescriptorError,
     IntegrationValidationError,
+    _catalog_shape_error,
 )
+
+
+class TestCatalogShapeValidator:
+    """The shared shape validator used by BOTH the fresh-fetch and cache-read
+    paths, so a poisoned/older cache can't bypass the format contract the fresh
+    fetch enforces (dict + 'schema_version' + dict 'integrations')."""
+
+    def test_valid_payload_returns_none(self):
+        assert _catalog_shape_error({"schema_version": "1.0", "integrations": {}}) is None
+
+    def test_missing_schema_version_is_rejected(self):
+        # The exact bypass the two paths used to disagree on: a dict with a dict
+        # 'integrations' but no 'schema_version'.
+        assert _catalog_shape_error({"integrations": {}}) is not None
+
+    def test_missing_integrations_is_rejected(self):
+        assert _catalog_shape_error({"schema_version": "1.0"}) is not None
+
+    def test_non_dict_integrations_is_rejected(self):
+        assert _catalog_shape_error({"schema_version": "1.0", "integrations": []}) is not None
+
+    @pytest.mark.parametrize("payload", [[], "x", 5, None])
+    def test_non_dict_payload_is_rejected(self, payload):
+        assert _catalog_shape_error(payload) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +93,37 @@ class TestCatalogURLValidation:
     def test_missing_host_rejected(self):
         with pytest.raises(IntegrationCatalogError, match="valid URL"):
             IntegrationCatalog._validate_catalog_url("https:///no-host")
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://:8080",                # port only, no host
+            "https://:8080/catalog.json",   # port only, with path
+            "https://:0",                   # port only, no host
+            "https://user@",                # userinfo only, no host
+            "https://user:pass@",           # userinfo only, no host
+        ],
+    )
+    def test_hostless_url_with_truthy_netloc_rejected(self, url):
+        # These have a truthy netloc (":8080", "user@") but no actual host,
+        # so a netloc-based check would wrongly accept them despite the
+        # "valid URL with a host" promise. hostname is None for all of them (#3209).
+        with pytest.raises(IntegrationCatalogError, match="valid URL"):
+            IntegrationCatalog._validate_catalog_url(url)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://[::1",                 # unclosed ipv6 bracket
+            "https://[not-an-ip]/c.json",   # bracketed non-ip host
+        ],
+    )
+    def test_malformed_url_rejected_cleanly(self, url):
+        # A malformed authority makes urlparse/hostname raise ValueError. The
+        # validator must turn that into its normal catalog error, not leak a
+        # raw ValueError to the caller.
+        with pytest.raises(IntegrationCatalogError, match="malformed"):
+            IntegrationCatalog._validate_catalog_url(url)
 
 
 # ---------------------------------------------------------------------------
@@ -166,12 +224,12 @@ class TestCatalogFetch:
     """Tests that use a local HTTP server stub via monkeypatch."""
 
     def _patch_urlopen(self, monkeypatch, catalog_data):
-        """Patch urllib.request.urlopen to return *catalog_data*."""
+        """Patch authentication.http.urllib.request.urlopen to return *catalog_data*."""
 
         class FakeResponse:
             def __init__(self, data, url=""):
                 self._data = json.dumps(data).encode()
-                self._url = url
+                self._url = url if isinstance(url, str) else url.full_url
 
             def read(self):
                 return self._data
@@ -185,11 +243,12 @@ class TestCatalogFetch:
             def __exit__(self, *a):
                 pass
 
-        def fake_urlopen(url, timeout=10):
+        def fake_urlopen(req, timeout=10):
+            url = req if isinstance(req, str) else req.full_url
             return FakeResponse(catalog_data, url)
 
-        import urllib.request
-        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        import specify_cli.authentication.http as _auth_http
+        monkeypatch.setattr(_auth_http.urllib.request, "urlopen", fake_urlopen)
 
     def test_fetch_and_search_all(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HOME", str(tmp_path))
@@ -218,6 +277,48 @@ class TestCatalogFetch:
         assert len(results) >= 1
         ids = [r["id"] for r in results]
         assert "acme-coder" in ids
+
+    def test_poisoned_cache_shape_is_dropped_and_refetched(self, tmp_path, monkeypatch):
+        """A fresh-but-mis-shaped cache (e.g. integrations as a list) must be
+        dropped and refetched, not returned — otherwise it later crashes on
+        .items(). The cache path must clear the same shape checks as a fresh
+        fetch."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        monkeypatch.delenv("SPECKIT_INTEGRATION_CATALOG_URL", raising=False)
+        (tmp_path / ".specify").mkdir()
+        cat = IntegrationCatalog(tmp_path)
+
+        catalog = {
+            "schema_version": "1.0",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "integrations": {
+                "acme-coder": {
+                    "id": "acme-coder", "name": "Acme Coder", "version": "2.0.0",
+                    "description": "Community integration", "author": "acme-org",
+                    "tags": ["cli"],
+                },
+            },
+        }
+        self._patch_urlopen(monkeypatch, catalog)
+        cat.search()  # populate the cache legitimately
+
+        # Poison the cached payload (integrations as a list), keeping the fresh
+        # metadata so the age check passes and the cache branch is taken.
+        cache_dir = tmp_path / ".specify" / "integrations" / ".cache"
+        data_files = [
+            f for f in cache_dir.glob("catalog-*.json")
+            if not f.name.endswith("-metadata.json")
+        ]
+        assert data_files, "cache was not populated"
+        data_files[0].write_text(
+            json.dumps({"schema_version": "1.0", "integrations": []}),
+            encoding="utf-8",
+        )
+
+        # The poisoned cache is dropped and the (valid) source is refetched.
+        results = cat.search()
+        assert "acme-coder" in [r["id"] for r in results]
 
     def test_search_by_tag(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HOME", str(tmp_path))
@@ -457,7 +558,6 @@ class TestIntegrationListCatalog:
                 "init", "--here",
                 "--integration", "copilot",
                 "--script", "sh",
-                "--no-git",
                 "--ignore-agent-tools",
             ], catch_exceptions=False)
         finally:
@@ -486,12 +586,12 @@ class TestIntegrationListCatalog:
             },
         }
 
-        import urllib.request
+        import specify_cli.authentication.http as _auth_http
 
         class FakeResponse:
             def __init__(self, data, url=""):
                 self._data = json.dumps(data).encode()
-                self._url = url
+                self._url = url if isinstance(url, str) else url.full_url
             def read(self):
                 return self._data
             def geturl(self):
@@ -501,7 +601,8 @@ class TestIntegrationListCatalog:
             def __exit__(self, *a):
                 pass
 
-        monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=10: FakeResponse(catalog, url))
+        monkeypatch.setattr(_auth_http.urllib.request, "urlopen",
+                            lambda req, timeout=10: FakeResponse(catalog, req if isinstance(req, str) else req.full_url))
 
         old = os.getcwd()
         try:
@@ -554,7 +655,6 @@ class TestIntegrationUpgrade:
                 "init", "--here",
                 "--integration", integration,
                 "--script", "sh",
-                "--no-git",
                 "--ignore-agent-tools",
             ], catch_exceptions=False)
         finally:
@@ -573,7 +673,7 @@ class TestIntegrationUpgrade:
         finally:
             os.chdir(old)
         assert result.exit_code != 0
-        assert "Not a spec-kit project" in result.output
+        assert "Not a Spec Kit project" in result.output
 
     def test_upgrade_no_integration_installed(self, tmp_path):
         from typer.testing import CliRunner
@@ -890,6 +990,57 @@ class TestCatalogSourceManagement:
         message = str(exc_info.value)
         assert str(cfg_path) in message
         assert "expected a mapping" in message
+
+    def test_add_catalog_rejects_inf_priority_in_existing_entry(
+        self, tmp_path, monkeypatch
+    ):
+        # ``priority: .inf`` loads as float('inf'); int() on it raises
+        # OverflowError, which used to escape the IntegrationValidationError
+        # contract as a raw traceback (github/spec-kit#3526 fixed the sibling
+        # workflow/step loaders the same way).
+        self._isolate(tmp_path, monkeypatch)
+        cfg_path = tmp_path / ".specify" / "integration-catalogs.yml"
+        cfg_path.write_text(
+            yaml.dump(
+                {
+                    "catalogs": [
+                        {
+                            "url": "https://a.example.com/catalog.json",
+                            "priority": float("inf"),
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        cat = IntegrationCatalog(tmp_path)
+        with pytest.raises(
+            IntegrationValidationError, match="must be an integer"
+        ):
+            cat.add_catalog("https://new.example.com/catalog.json")
+
+    def test_remove_catalog_tolerates_inf_priority(self, tmp_path, monkeypatch):
+        # Building the remove display order must not crash on a ``priority:
+        # .inf`` entry; it falls back to positional order like the other
+        # non-integer priorities do.
+        self._isolate(tmp_path, monkeypatch)
+        cfg_path = tmp_path / ".specify" / "integration-catalogs.yml"
+        cfg_path.write_text(
+            yaml.dump(
+                {
+                    "catalogs": [
+                        {
+                            "url": "https://a.example.com/catalog.json",
+                            "priority": float("inf"),
+                        },
+                        {"url": "https://b.example.com/catalog.json", "priority": 2},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        cat = IntegrationCatalog(tmp_path)
+        cat.remove_catalog(0)  # must not raise OverflowError
 
     def test_add_catalog_skips_blank_url_entries(self, tmp_path, monkeypatch):
         self._isolate(tmp_path, monkeypatch)

@@ -21,6 +21,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import yaml
 from packaging import version as pkg_version
 
+from ..catalogs import CatalogEntry, CatalogStackBase
+
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -38,26 +40,38 @@ class IntegrationDescriptorError(Exception):
     """Raised when an integration.yml descriptor is invalid."""
 
 
+def _catalog_shape_error(payload: Any) -> Optional[str]:
+    """Return a human-readable reason if *payload* is not a valid integration
+    catalog document, else ``None``.
+
+    Shared by the fresh-fetch and cache-read paths so both enforce the same
+    format contract: a JSON object carrying ``schema_version`` and a mapping
+    ``integrations``. Keeping a single validator prevents the cache-read path
+    from accepting a legacy payload that fresh-fetch validation would reject.
+    """
+    if not isinstance(payload, dict):
+        return "expected a JSON object"
+    if "schema_version" not in payload or "integrations" not in payload:
+        return "missing required 'schema_version' or 'integrations' key"
+    if not isinstance(payload.get("integrations"), dict):
+        return "'integrations' must be a JSON object"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # IntegrationCatalogEntry
 # ---------------------------------------------------------------------------
 
 @dataclass
-class IntegrationCatalogEntry:
+class IntegrationCatalogEntry(CatalogEntry):
     """Represents a single catalog source in the catalog stack."""
-
-    url: str
-    name: str
-    priority: int
-    install_allowed: bool
-    description: str = ""
 
 
 # ---------------------------------------------------------------------------
 # IntegrationCatalog
 # ---------------------------------------------------------------------------
 
-class IntegrationCatalog:
+class IntegrationCatalog(CatalogStackBase):
     """Manages integration catalog fetching, caching, and searching."""
 
     DEFAULT_CATALOG_URL = (
@@ -67,135 +81,14 @@ class IntegrationCatalog:
         "https://raw.githubusercontent.com/github/spec-kit/main/integrations/catalog.community.json"
     )
     CACHE_DURATION = 3600  # 1 hour
+    CONFIG_FILENAME = "integration-catalogs.yml"
+    ENTRY_CLASS = IntegrationCatalogEntry
+    ERROR_TYPE = IntegrationCatalogError
+    VALIDATION_ERROR_TYPE = IntegrationValidationError
 
     def __init__(self, project_root: Path) -> None:
         self.project_root = project_root
         self.cache_dir = project_root / ".specify" / "integrations" / ".cache"
-
-    # -- URL validation ---------------------------------------------------
-
-    @staticmethod
-    def _validate_catalog_url(url: str) -> None:
-        from urllib.parse import urlparse
-
-        parsed = urlparse(url)
-        is_localhost = parsed.hostname in ("localhost", "127.0.0.1", "::1")
-        if parsed.scheme != "https" and not (parsed.scheme == "http" and is_localhost):
-            raise IntegrationCatalogError(
-                f"Catalog URL must use HTTPS (got {parsed.scheme}://). "
-                "HTTP is only allowed for localhost."
-            )
-        if not parsed.netloc:
-            raise IntegrationCatalogError(
-                "Catalog URL must be a valid URL with a host."
-            )
-
-    # -- Catalog stack ----------------------------------------------------
-
-    def _load_catalog_config(
-        self, config_path: Path
-    ) -> Optional[List[IntegrationCatalogEntry]]:
-        """Load catalog stack from a YAML file.
-
-        Returns None when the file does not exist.
-
-        Raises:
-            IntegrationValidationError: on any local-config / YAML problem
-                (parse failures, wrong shape, missing/invalid fields,
-                invalid catalog URLs, etc.). This is a subclass of
-                :class:`IntegrationCatalogError`, so any caller that already
-                catches ``IntegrationCatalogError`` keeps working — but
-                callers that want to distinguish *local config* problems
-                from *remote/network* problems can match the subclass.
-        """
-        if not config_path.exists():
-            return None
-        try:
-            data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-        except (yaml.YAMLError, OSError, UnicodeError) as exc:
-            raise IntegrationValidationError(
-                f"Failed to read catalog config {config_path}: {exc}"
-            ) from exc
-        if data is None:
-            data = {}
-        if not isinstance(data, dict):
-            raise IntegrationValidationError(
-                f"Invalid catalog config {config_path}: expected a YAML mapping at the root"
-            )
-        catalogs_data = data.get("catalogs", [])
-        if not isinstance(catalogs_data, list):
-            raise IntegrationValidationError(
-                f"Invalid catalog config {config_path}: 'catalogs' must be a list, "
-                f"got {type(catalogs_data).__name__}"
-            )
-        if not catalogs_data:
-            raise IntegrationValidationError(
-                f"Catalog config {config_path} exists but contains no 'catalogs' entries. "
-                f"Remove the file to use built-in defaults, or add valid catalog entries."
-            )
-        entries: List[IntegrationCatalogEntry] = []
-        skipped: List[int] = []
-        for idx, item in enumerate(catalogs_data):
-            if not isinstance(item, dict):
-                raise IntegrationValidationError(
-                    f"Invalid catalog config {config_path}: catalog entry at index {idx}: "
-                    f"expected a mapping, got {type(item).__name__}"
-                )
-            url = str(item.get("url", "")).strip()
-            if not url:
-                skipped.append(idx)
-                continue
-            try:
-                self._validate_catalog_url(url)
-            except IntegrationCatalogError as exc:
-                # ``_validate_catalog_url`` raises the base class for direct
-                # callers (e.g. ``add_catalog`` validating user input); when
-                # the bad URL came from a local config file, surface it as a
-                # validation error so CLI handlers can route it accordingly.
-                raise IntegrationValidationError(
-                    f"Invalid catalog URL in {config_path} at index {idx}: {exc}"
-                ) from exc
-            raw_priority = item.get("priority", idx + 1)
-            if isinstance(raw_priority, bool):
-                raise IntegrationValidationError(
-                    f"Invalid catalog config {config_path}: "
-                    f"Invalid priority for catalog '{item.get('name', idx + 1)}': "
-                    f"expected integer, got {raw_priority!r}"
-                )
-            try:
-                priority = int(raw_priority)
-            except (TypeError, ValueError):
-                raise IntegrationValidationError(
-                    f"Invalid catalog config {config_path}: "
-                    f"Invalid priority for catalog '{item.get('name', idx + 1)}': "
-                    f"expected integer, got {raw_priority!r}"
-                )
-            raw_install = item.get("install_allowed", False)
-            if isinstance(raw_install, str):
-                install_allowed = raw_install.strip().lower() in ("true", "yes", "1")
-            else:
-                install_allowed = bool(raw_install)
-            raw_name = item.get("name")
-            name = str(raw_name).strip() if raw_name is not None else ""
-            if not name:
-                name = f"catalog-{len(entries) + 1}"
-            entries.append(
-                IntegrationCatalogEntry(
-                    url=url,
-                    name=name,
-                    priority=priority,
-                    install_allowed=install_allowed,
-                    description=str(item.get("description", "")),
-                )
-            )
-        entries.sort(key=lambda e: e.priority)
-        if not entries:
-            raise IntegrationValidationError(
-                f"Catalog config {config_path} contains {len(catalogs_data)} "
-                f"entries but none have valid URLs (entries at indices {skipped} "
-                f"were skipped). Each catalog entry must have a 'url' field."
-            )
-        return entries
 
     def get_active_catalogs(self) -> List[IntegrationCatalogEntry]:
         """Return the ordered list of active integration catalogs.
@@ -265,7 +158,6 @@ class IntegrationCatalog:
     ) -> Dict[str, Any]:
         """Fetch one catalog, with per-URL caching."""
         import urllib.error
-        import urllib.request
 
         url_hash = hashlib.sha256(entry.url.encode()).hexdigest()[:16]
         cache_file = self.cache_dir / f"catalog-{url_hash}.json"
@@ -279,7 +171,15 @@ class IntegrationCatalog:
                     cached_at = cached_at.replace(tzinfo=timezone.utc)
                 age = (datetime.now(timezone.utc) - cached_at).total_seconds()
                 if age < self.CACHE_DURATION:
-                    return json.loads(cache_file.read_text(encoding="utf-8"))
+                    cached = json.loads(cache_file.read_text(encoding="utf-8"))
+                    # Cached payloads use the same shape validator as fresh
+                    # fetches; malformed cache entries are discarded and
+                    # re-fetched so callers always receive the documented
+                    # catalog object shape.
+                    shape_error = _catalog_shape_error(cached)
+                    if shape_error is not None:
+                        raise ValueError(f"cached catalog has invalid shape: {shape_error}")
+                    return cached
             except (json.JSONDecodeError, ValueError, KeyError, TypeError, AttributeError, OSError, UnicodeError):
                 # Cache is invalid or stale metadata; delete and refetch from source.
                 try:
@@ -289,27 +189,19 @@ class IntegrationCatalog:
                     pass  # Cache cleanup is best-effort; ignore deletion failures.
 
         try:
-            with urllib.request.urlopen(entry.url, timeout=10) as resp:
+            from specify_cli.authentication.http import open_url
+
+            with open_url(entry.url, timeout=10) as resp:
                 # Validate final URL after redirects
                 final_url = resp.geturl()
                 if final_url != entry.url:
                     self._validate_catalog_url(final_url)
                 catalog_data = json.loads(resp.read())
 
-            if not isinstance(catalog_data, dict):
+            shape_error = _catalog_shape_error(catalog_data)
+            if shape_error is not None:
                 raise IntegrationCatalogError(
-                    f"Invalid catalog format from {entry.url}: expected a JSON object"
-                )
-            if (
-                "schema_version" not in catalog_data
-                or "integrations" not in catalog_data
-            ):
-                raise IntegrationCatalogError(
-                    f"Invalid catalog format from {entry.url}"
-                )
-            if not isinstance(catalog_data.get("integrations"), dict):
-                raise IntegrationCatalogError(
-                    f"Invalid catalog format from {entry.url}: 'integrations' must be a JSON object"
+                    f"Invalid catalog format from {entry.url}: {shape_error}"
                 )
 
             try:
@@ -443,8 +335,6 @@ class IntegrationCatalog:
 
     # -- Catalog-source management ----------------------------------------
 
-    CONFIG_FILENAME = "integration-catalogs.yml"
-
     def get_catalog_configs(self) -> List[Dict[str, Any]]:
         """Return the active catalog stack as a list of dicts.
 
@@ -555,7 +445,8 @@ class IntegrationCatalog:
                     )
                 try:
                     normalized_priority = int(raw_priority)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
+                    # OverflowError: int(float("inf")) — a ``priority: .inf``.
                     raise IntegrationValidationError(
                         f"Invalid catalog entry at index {idx} in {config_path}: "
                         f"'priority' must be an integer, got "
@@ -663,7 +554,8 @@ class IntegrationCatalog:
             else:
                 try:
                     priority = int(raw_priority)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
+                    # OverflowError: int(float("inf")) — a ``priority: .inf``.
                     priority = yaml_idx + 1
             priority_pairs.append((priority, yaml_idx))
         if not priority_pairs:
@@ -698,8 +590,8 @@ class IntegrationCatalog:
             # treats an empty list as an error, so leaving the file would
             # break every subsequent `integration` command until the user
             # manually deletes `.specify/integration-catalogs.yml`.
-            # Deleting the file lets the project fall back to built-in
-            # defaults, which matches the behavior before any
+            # Deleting the file restores built-in defaults, which matches the
+            # behavior before any
             # `catalog add` was ever run.
             try:
                 config_path.unlink(missing_ok=True)
@@ -708,7 +600,7 @@ class IntegrationCatalog:
                     f"Failed to delete catalog config {config_path}: {exc}"
                 ) from exc
 
-        fallback_name = f"catalog-{index + 1}"
+        generated_name = f"catalog-{index + 1}"
         if isinstance(removed, dict):
             removed_name = removed.get("name")
             if removed_name is not None:
@@ -721,7 +613,7 @@ class IntegrationCatalog:
                 normalized_url = str(removed_url).strip()
                 if normalized_url:
                     return normalized_url
-        return fallback_name
+        return generated_name
 
 
 # ---------------------------------------------------------------------------
