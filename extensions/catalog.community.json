@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0",
-  "updated_at": "2026-07-24T00:00:00Z",
+  "updated_at": "2026-07-29T00:00:00Z",
   "catalog_url": "https://raw.githubusercontent.com/github/spec-kit/main/extensions/catalog.community.json",
   "extensions": {
     "aide": {
@@ -1070,6 +1070,41 @@
       "created_at": "2026-03-29T00:00:00Z",
       "updated_at": "2026-03-29T00:00:00Z"
     },
+    "contextforge-mcp": {
+      "name": "ContextForge MCP",
+      "id": "contextforge-mcp",
+      "description": "Integrates codebase-memory-mcp + headroom into Spec Kit — graph-based code intelligence and context compression for the implement phase.",
+      "author": "capatinore",
+      "version": "0.1.0",
+      "download_url": "https://github.com/capatinore/contextforge-mcp/releases/download/ext-v0.1.0/contextforge-mcp-speckit-extension.zip",
+      "repository": "https://github.com/capatinore/contextforge-mcp",
+      "homepage": "https://github.com/capatinore/contextforge-mcp",
+      "documentation": "https://github.com/capatinore/contextforge-mcp/blob/main/README.md",
+      "changelog": "",
+      "license": "MIT",
+      "category": "code",
+      "effect": "read-write",
+      "requires": {
+        "speckit_version": ">=0.10.0"
+      },
+      "provides": {
+        "commands": 4,
+        "hooks": 0
+      },
+      "tags": [
+        "mcp",
+        "code-intelligence",
+        "context-compression",
+        "tokens",
+        "claude",
+        "spec-driven-development"
+      ],
+      "verified": false,
+      "downloads": 0,
+      "stars": 0,
+      "created_at": "2026-07-13T00:00:00Z",
+      "updated_at": "2026-07-13T00:00:00Z"
+    },
     "cost": {
       "name": "Cost Tracker",
       "id": "cost",
@@ -1619,8 +1654,8 @@
       "id": "gates",
       "description": "Deterministic quality enforcement for Spec Kit across agent hooks, git checks, and CI pipelines with one policy file and one verify entrypoint for identical results at every boundary.",
       "author": "schwichtgit",
-      "version": "0.3.2",
-      "download_url": "https://github.com/schwichtgit/spec-gates/releases/download/v0.3.2/gates-0.3.2.zip",
+      "version": "0.3.3",
+      "download_url": "https://github.com/schwichtgit/spec-gates/releases/download/v0.3.3/gates-0.3.3.zip",
       "repository": "https://github.com/schwichtgit/spec-gates",
       "homepage": "https://github.com/schwichtgit/spec-gates",
       "documentation": "https://github.com/schwichtgit/spec-gates/blob/main/docs/how-it-works.md",
@@ -1664,7 +1699,7 @@
       "downloads": 0,
       "stars": 0,
       "created_at": "2026-07-09T00:00:00Z",
-      "updated_at": "2026-07-15T00:00:00Z"
+      "updated_at": "2026-07-27T00:00:00Z"
     },
     "github-issues": {
       "name": "GitHub Issues Integration 1",
@@ -1860,6 +1895,40 @@
       "stars": 0,
       "created_at": "2026-06-23T00:00:00Z",
       "updated_at": "2026-06-30T00:00:00Z"
+    },
+    "intent": {
+      "name": "Intent Reconciliation",
+      "id": "intent",
+      "description": "Reconcile implementation-discovered decisions against approved feature intent",
+      "author": "SuhaibAslam",
+      "version": "1.0.2",
+      "download_url": "https://github.com/SuhaibAslam/spec-kit-reconcile/archive/refs/tags/v1.0.2.zip",
+      "repository": "https://github.com/SuhaibAslam/spec-kit-reconcile",
+      "homepage": "https://github.com/SuhaibAslam/spec-kit-reconcile",
+      "documentation": "https://github.com/SuhaibAslam/spec-kit-reconcile/blob/main/README.md",
+      "changelog": "https://github.com/SuhaibAslam/spec-kit-reconcile/blob/main/CHANGELOG.md",
+      "license": "MIT",
+      "category": "process",
+      "effect": "read-write",
+      "requires": {
+        "speckit_version": ">=0.12.0"
+      },
+      "provides": {
+        "commands": 3,
+        "hooks": 0
+      },
+      "tags": [
+        "intent",
+        "decisions",
+        "reconciliation",
+        "drift",
+        "workflow"
+      ],
+      "verified": false,
+      "downloads": 0,
+      "stars": 0,
+      "created_at": "2026-07-29T00:00:00Z",
+      "updated_at": "2026-07-29T00:00:00Z"
     },
     "issue": {
       "name": "GitHub Issues Integration 2",
@@ -2075,11 +2144,11 @@
       "id": "linear-weave",
       "description": "Weave Spec Kit into Linear: pull requirements, mirror tasks.md into sub-issues, sync statuses.",
       "author": "Tony Woodhouse",
-      "version": "1.0.0",
-      "download_url": "https://github.com/tonydwoodhouse/spec-kit-linear-weave/archive/refs/tags/v1.0.0.zip",
+      "version": "1.0.1",
+      "download_url": "https://github.com/tonydwoodhouse/spec-kit-linear-weave/archive/refs/tags/v1.0.1.zip",
       "repository": "https://github.com/tonydwoodhouse/spec-kit-linear-weave",
       "homepage": "https://github.com/tonydwoodhouse/spec-kit-linear-weave",
-      "documentation": "https://github.com/tonydwoodhouse/spec-kit-linear-weave#readme",
+      "documentation": "https://github.com/tonydwoodhouse/spec-kit-linear-weave/blob/main/README.md",
       "changelog": "https://github.com/tonydwoodhouse/spec-kit-linear-weave/blob/main/CHANGELOG.md",
       "license": "MIT",
       "category": "integration",
@@ -2102,7 +2171,7 @@
       "downloads": 0,
       "stars": 0,
       "created_at": "2026-07-21T00:00:00Z",
-      "updated_at": "2026-07-21T00:00:00Z"
+      "updated_at": "2026-07-27T00:00:00Z"
     },
     "loop": {
       "name": "Loop Engineering",
@@ -4818,11 +4887,11 @@
     "verify-review-ship": {
       "name": "Verify Review Ship",
       "id": "verify-review-ship",
-      "description": "Adds verify and review quality gates plus transactional merge, cleanup, and delivery summary.",
+      "description": "Post-convergence operational verification, technical review, learning governance, and transactional delivery.",
       "author": "Carlos Eduardo Gevaerd Araujo",
-      "version": "0.3.0",
-      "download_url": "https://github.com/cadugevaerd/spec-kit-verify-review-ship/archive/refs/tags/v0.3.0.zip",
-      "sha256": "a7326c899855f46ff28e9f03ede2f89c4db0fd2b8a64c85017b3ab639e004fd3",
+      "version": "0.4.2",
+      "download_url": "https://github.com/cadugevaerd/spec-kit-verify-review-ship/archive/refs/tags/v0.4.2.zip",
+      "sha256": "71dceef5bf81d7ac54faa26bb5cf279554815a4928ee8d0c8e9bfb4c3e2bb0ab",
       "repository": "https://github.com/cadugevaerd/spec-kit-verify-review-ship",
       "homepage": "https://github.com/cadugevaerd/spec-kit-verify-review-ship",
       "documentation": "https://github.com/cadugevaerd/spec-kit-verify-review-ship/blob/main/README.md",
@@ -4831,24 +4900,27 @@
       "category": "process",
       "effect": "read-write",
       "requires": {
-        "speckit_version": ">=0.1.0"
+        "speckit_version": ">=0.11.2"
       },
       "provides": {
         "commands": 3,
-        "hooks": 1
+        "hooks": 0
       },
       "tags": [
         "quality",
         "review",
         "shipping",
         "merge",
-        "workflow"
+        "cleanup",
+        "learning",
+        "governance",
+        "agent-skills"
       ],
       "verified": false,
       "downloads": 0,
       "stars": 0,
       "created_at": "2026-07-10T00:00:00Z",
-      "updated_at": "2026-07-24T00:00:00Z"
+      "updated_at": "2026-07-28T00:00:00Z"
     },
     "verify-tasks": {
       "name": "Verify Tasks Extension",

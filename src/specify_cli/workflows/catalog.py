@@ -22,6 +22,8 @@ from typing import Any
 
 import yaml
 
+from .._download_security import MAX_JSON_CATALOG_BYTES, read_response_limited
+
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -308,7 +310,8 @@ class WorkflowCatalog:
         try:
             parsed = urlparse(url)
             hostname = parsed.hostname
-        except ValueError:
+            _ = parsed.port
+        except (TypeError, ValueError):
             raise WorkflowValidationError(
                 f"Catalog URL is malformed: {url}"
             ) from None
@@ -332,26 +335,45 @@ class WorkflowCatalog:
         if not config_path.exists():
             return None
         try:
-            data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         except (yaml.YAMLError, OSError, UnicodeError) as exc:
             raise WorkflowValidationError(
                 f"Failed to read catalog config {config_path}: {exc}"
             ) from exc
+        # An empty document (or explicit ``null``) parses to None -> this config
+        # layer contributes nothing, so ``get_active_catalogs`` moves on to the
+        # next layer (this loader serves both the project and user configs;
+        # the built-in defaults apply only once every layer has returned None).
+        # Do NOT coerce with ``or {}`` here: that also turns a FALSY non-mapping
+        # (top-level ``[]``, ``false``, ``0``, ``''``) into ``{}`` and silently
+        # swallows it, while a TRUTHY non-mapping (``5``, a bare list) correctly
+        # raises below -- an inconsistency. Only None means "no document".
+        if data is None:
+            return None
         if not isinstance(data, dict):
             raise WorkflowValidationError(
                 f"Invalid catalog config: expected a mapping, "
                 f"got {type(data).__name__}"
             )
-        catalogs_data = data.get("catalogs", [])
-        if not catalogs_data:
-            # Empty catalogs list (e.g. after removing last entry)
-            # is valid — fall back to built-in defaults.
+        # Same asymmetry as the top level above, one nesting level down: the
+        # shape check has to run BEFORE the emptiness check, or a FALSY non-list
+        # (``catalogs: {}``/``''``/``0``/``false``) is silently swallowed as
+        # "no catalogs" while a TRUTHY non-list (``catalogs: 5``) correctly
+        # raises. An absent key, an explicit ``catalogs:`` null, and an empty
+        # list all keep their existing "nothing configured here" behavior --
+        # only the misreported shapes change.
+        catalogs_data = data.get("catalogs")
+        if catalogs_data is None:
             return None
         if not isinstance(catalogs_data, list):
             raise WorkflowValidationError(
                 f"Invalid catalog config: 'catalogs' must be a list, "
                 f"got {type(catalogs_data).__name__}"
             )
+        if not catalogs_data:
+            # Empty catalogs list (e.g. after removing last entry)
+            # is valid — fall back to built-in defaults.
+            return None
 
         entries: list[WorkflowCatalogEntry] = []
         for idx, item in enumerate(catalogs_data):
@@ -473,6 +495,8 @@ class WorkflowCatalog:
         try:
             with open(meta_file, encoding="utf-8") as f:
                 meta = json.load(f)
+            if not isinstance(meta, dict):
+                return False
             fetched_at = float(meta.get("fetched_at", 0))
             return (time.time() - fetched_at) < self.CACHE_DURATION
         except (json.JSONDecodeError, OSError, TypeError, ValueError):
@@ -487,8 +511,10 @@ class WorkflowCatalog:
         if not force_refresh and self._is_url_cache_valid(entry.url):
             try:
                 with open(cache_file, encoding="utf-8") as f:
-                    return json.load(f)
-            except (json.JSONDecodeError, OSError):
+                    cached = json.load(f)
+                if isinstance(cached, dict):
+                    return cached
+            except (UnicodeDecodeError, json.JSONDecodeError, OSError):
                 # Ignore invalid/unreadable cache and fall back to fetching from source.
                 pass
 
@@ -505,7 +531,8 @@ class WorkflowCatalog:
             try:
                 parsed = urlparse(url)
                 hostname = parsed.hostname
-            except ValueError:
+                _ = parsed.port
+            except (TypeError, ValueError):
                 raise WorkflowCatalogError(
                     f"Refusing to fetch catalog from malformed URL: {url}"
                 ) from None
@@ -538,13 +565,22 @@ class WorkflowCatalog:
                 entry.url, timeout=30, redirect_validator=_validate_redirect
             ) as resp:
                 _validate_catalog_url(resp.geturl())
-                data = json.loads(resp.read().decode("utf-8"))
+                data = json.loads(
+                    read_response_limited(
+                        resp,
+                        max_bytes=MAX_JSON_CATALOG_BYTES,
+                        error_type=WorkflowCatalogError,
+                        label="workflow catalog",
+                    ).decode("utf-8")
+                )
         except Exception as exc:
             # Fall back to cache if available
             if cache_file.exists():
                 try:
                     with open(cache_file, encoding="utf-8") as f:
-                        return json.load(f)
+                        cached = json.load(f)
+                    if isinstance(cached, dict):
+                        return cached
                 except (json.JSONDecodeError, ValueError, OSError):
                     # Stale-cache read failed; let the original fetch error propagate.
                     pass
@@ -982,7 +1018,8 @@ class StepCatalog:
         try:
             parsed = urlparse(url)
             hostname = parsed.hostname
-        except ValueError:
+            _ = parsed.port
+        except (TypeError, ValueError):
             raise StepValidationError(
                 f"Catalog URL is malformed: {url}"
             ) from None
@@ -1006,24 +1043,33 @@ class StepCatalog:
         if not config_path.exists():
             return None
         try:
-            data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         except (yaml.YAMLError, OSError, UnicodeError) as exc:
             raise StepValidationError(
                 f"Failed to read catalog config {config_path}: {exc}"
             ) from exc
+        # Same two guards as WorkflowCatalog._load_catalog_config above, kept in
+        # lockstep: this is the step-catalog twin of that loader and read the
+        # same way. Dropping ``or {}`` stops a falsy non-mapping top level from
+        # being coerced past the isinstance check, and the ``catalogs`` shape
+        # check runs before the emptiness check for the same reason.
+        if data is None:
+            return None
         if not isinstance(data, dict):
             raise StepValidationError(
                 f"Invalid catalog config: expected a mapping, "
                 f"got {type(data).__name__}"
             )
-        catalogs_data = data.get("catalogs", [])
-        if not catalogs_data:
+        catalogs_data = data.get("catalogs")
+        if catalogs_data is None:
             return None
         if not isinstance(catalogs_data, list):
             raise StepValidationError(
                 f"Invalid catalog config: 'catalogs' must be a list, "
                 f"got {type(catalogs_data).__name__}"
             )
+        if not catalogs_data:
+            return None
 
         entries: list[StepCatalogEntry] = []
         for idx, item in enumerate(catalogs_data):
@@ -1144,6 +1190,8 @@ class StepCatalog:
         try:
             with open(meta_file, encoding="utf-8") as f:
                 meta = json.load(f)
+            if not isinstance(meta, dict):
+                return False
             fetched_at = float(meta.get("fetched_at", 0))
             return (time.time() - fetched_at) < self.CACHE_DURATION
         except (json.JSONDecodeError, OSError, TypeError, ValueError):
@@ -1162,7 +1210,7 @@ class StepCatalog:
                     cached = json.load(f)
                 if isinstance(cached, dict):
                     return cached
-            except (json.JSONDecodeError, OSError):
+            except (UnicodeDecodeError, json.JSONDecodeError, OSError):
                 # Ignore invalid/unreadable cache and fall back to fetching from source.
                 pass
 
@@ -1178,7 +1226,8 @@ class StepCatalog:
             try:
                 parsed = urlparse(url)
                 hostname = parsed.hostname
-            except ValueError:
+                _ = parsed.port
+            except (TypeError, ValueError):
                 raise StepCatalogError(
                     f"Refusing to fetch catalog from malformed URL: {url}"
                 ) from None
@@ -1211,7 +1260,14 @@ class StepCatalog:
                 entry.url, timeout=30, redirect_validator=_validate_redirect
             ) as resp:
                 _validate_url(resp.geturl())
-                data = json.loads(resp.read().decode("utf-8"))
+                data = json.loads(
+                    read_response_limited(
+                        resp,
+                        max_bytes=MAX_JSON_CATALOG_BYTES,
+                        error_type=StepCatalogError,
+                        label="step catalog",
+                    ).decode("utf-8")
+                )
         except Exception as exc:
             if cache_safe and cache_file.exists():
                 try:
