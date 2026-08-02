@@ -10,15 +10,24 @@ The engine is the orchestrator that:
 
 from __future__ import annotations
 
+import dataclasses
 import json
+import os
 import re
+import tempfile
+import threading
 import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from ..integration_state import (
+    default_integration_key,
+    try_read_integration_json,
+)
 from .base import RunStatus, StepContext, StepResult, StepStatus
 
 
@@ -47,9 +56,18 @@ class WorkflowDefinition:
         if not isinstance(self.default_options, dict):
             self.default_options = {}
 
-        # Requirements (declared but not yet enforced at runtime;
-        # enforcement is a planned enhancement)
-        self.requires: dict[str, Any] = data.get("requires", {})
+        # Advisory pre-conditions (spec-kit version / integrations a workflow
+        # expects). Validated by ``validate_workflow`` (recognized keys only;
+        # see ``_RECOGNIZED_REQUIRES_KEYS``) but NOT enforced at run time — they
+        # are not a security boundary. In particular there is no
+        # ``requires.permissions`` capability gate: shell steps always run with
+        # the user's privileges.
+        #
+        # Holds the raw parsed value, so before ``validate_workflow`` runs it may
+        # be a non-mapping (``None`` for a bare ``requires:``, a list for
+        # ``requires: []``, etc.); typed ``Any`` rather than ``dict[str, Any]``
+        # to avoid implying it is always a mapping at this point.
+        self.requires: Any = data.get("requires", {})
 
         # Inputs
         self.inputs: dict[str, Any] = data.get("inputs", {})
@@ -61,7 +79,11 @@ class WorkflowDefinition:
     def from_yaml(cls, path: Path) -> WorkflowDefinition:
         """Load a workflow definition from a YAML file."""
         with open(path, encoding="utf-8") as f:
-            data = yaml.safe_load(f)
+            try:
+                data = yaml.safe_load(f)
+            except yaml.YAMLError as exc:
+                msg = f"Invalid YAML in {path}: {exc}"
+                raise ValueError(msg) from exc
         if not isinstance(data, dict):
             msg = f"Workflow YAML must be a mapping, got {type(data).__name__}."
             raise ValueError(msg)
@@ -70,7 +92,11 @@ class WorkflowDefinition:
     @classmethod
     def from_string(cls, content: str) -> WorkflowDefinition:
         """Load a workflow definition from a YAML string."""
-        data = yaml.safe_load(content)
+        try:
+            data = yaml.safe_load(content)
+        except yaml.YAMLError as exc:
+            msg = f"Invalid YAML: {exc}"
+            raise ValueError(msg) from exc
         if not isinstance(data, dict):
             msg = f"Workflow YAML must be a mapping, got {type(data).__name__}."
             raise ValueError(msg)
@@ -82,6 +108,15 @@ class WorkflowDefinition:
 # ID format: lowercase alphanumeric with hyphens
 _ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]*[a-z0-9]$|^[a-z0-9]$")
 
+# Keys accepted under a workflow's ``requires`` block: the advisory
+# pre-conditions documented for workflows (``speckit_version`` and
+# ``integrations``). This is the *workflow* schema only — the bundle manifest's
+# ``requires`` (see ``bundler/models/manifest.py``) is a separate schema that
+# also carries ``tools``/``mcp``; those are not workflow ``requires`` keys.
+# Any other key — notably ``permissions`` — is rejected by ``validate_workflow``
+# so it is never mistaken for an enforced runtime control.
+_RECOGNIZED_REQUIRES_KEYS = frozenset({"speckit_version", "integrations"})
+
 # Valid step types (matching STEP_REGISTRY keys)
 def _get_valid_step_types() -> set[str]:
     """Return valid step types from the registry, with a built-in fallback."""
@@ -89,7 +124,7 @@ def _get_valid_step_types() -> set[str]:
     if STEP_REGISTRY:
         return set(STEP_REGISTRY.keys())
     return {
-        "command", "shell", "prompt", "gate", "if",
+        "command", "shell", "prompt", "gate", "if", "init",
         "switch", "while", "do-while", "fan-out", "fan-in",
     }
 
@@ -102,27 +137,50 @@ def validate_workflow(definition: WorkflowDefinition) -> list[str]:
     errors: list[str] = []
 
     # -- Schema version ---------------------------------------------------
-    if definition.schema_version not in ("1.0", "1"):
+    # str() so an unquoted ``schema_version: 1.0`` (YAML float) is accepted —
+    # rejecting it would print "Unsupported schema_version 1.0. Expected '1.0'."
+    if str(definition.schema_version) != "1.0":
         errors.append(
             f"Unsupported schema_version {definition.schema_version!r}. "
             f"Expected '1.0'."
         )
 
     # -- Top-level fields -------------------------------------------------
-    if not definition.id:
+    # YAML parses unquoted scalars like ``id: 123`` or ``version: 1.0`` as
+    # int/float; check types before regex/string operations so authoring
+    # mistakes surface as validation errors instead of tracebacks. Only
+    # ``None``/empty-string count as missing so falsey non-strings
+    # (``id: 0``, ``name: false``) still get the typed error.
+    if definition.id is None or definition.id == "":
         errors.append("Workflow is missing 'workflow.id'.")
-    elif not _ID_PATTERN.match(definition.id):
+    elif not isinstance(definition.id, str):
+        errors.append(
+            f"'workflow.id' must be a string, got "
+            f"{type(definition.id).__name__} ({definition.id!r})."
+        )
+    elif not _ID_PATTERN.fullmatch(definition.id):
         errors.append(
             f"Workflow ID {definition.id!r} must be lowercase alphanumeric "
             f"with hyphens."
         )
 
-    if not definition.name:
+    if definition.name is None or definition.name == "":
         errors.append("Workflow is missing 'workflow.name'.")
+    elif not isinstance(definition.name, str):
+        errors.append(
+            f"'workflow.name' must be a string, got "
+            f"{type(definition.name).__name__} ({definition.name!r})."
+        )
 
-    if not definition.version:
+    if definition.version is None or definition.version == "":
         errors.append("Workflow is missing 'workflow.version'.")
-    elif not re.match(r"^\d+\.\d+\.\d+$", definition.version):
+    elif not isinstance(definition.version, str):
+        errors.append(
+            f"'workflow.version' must be a string, got "
+            f"{type(definition.version).__name__} ({definition.version!r}) — "
+            f'quote it in YAML (version: "1.0.0").'
+        )
+    elif not re.fullmatch(r"\d+\.\d+\.\d+", definition.version):
         errors.append(
             f"Workflow version {definition.version!r} is not valid "
             f"semantic versioning (expected X.Y.Z)."
@@ -141,6 +199,94 @@ def validate_workflow(definition: WorkflowDefinition) -> list[str]:
                 errors.append(
                     f"Input {input_name!r} has invalid type {input_type!r}. "
                     f"Must be 'string', 'number', or 'boolean'."
+                )
+
+            # ``enum`` must be a list. Checked here — not only via the
+            # ``_coerce_input`` call below — because that call is reached only
+            # when a ``default`` is present, and the ``integration: auto`` case
+            # strips ``enum`` before coercing; a scalar/string ``enum`` on an
+            # input with no default (or the auto-integration default) would
+            # otherwise slip through here and then crash ``_resolve_inputs`` with
+            # a raw ``TypeError`` at run time. ``None`` means "no enum".
+            enum_values = input_def.get("enum")
+            if enum_values is not None and not isinstance(enum_values, list):
+                errors.append(
+                    f"Input {input_name!r} has invalid 'enum': must be a list, "
+                    f"got {type(enum_values).__name__}."
+                )
+
+            # Validate the default eagerly so authoring mistakes (e.g. a
+            # default not in the declared enum, or a non-numeric default for
+            # a number input) surface at install/validation time instead of
+            # at workflow-execution time. ``"auto"`` for the integration
+            # input is a runtime-resolved sentinel, so only the
+            # enum-membership check is exempted for that exact case — the
+            # declared type is still enforced (e.g. ``type: number`` paired
+            # with ``default: "auto"`` is still rejected).
+            enum_is_valid = enum_values is None or isinstance(enum_values, list)
+            if "default" in input_def:
+                default_value = input_def["default"]
+                is_auto_integration = (
+                    input_name == "integration" and default_value == "auto"
+                )
+                # Strip ``enum`` from the definition handed to ``_coerce_input``
+                # when either:
+                #   * this is the auto-integration sentinel (enum-membership is
+                #     a runtime concern, exempted for ``"auto"``), or
+                #   * the ``enum`` is malformed (non-list) and already reported
+                #     above — leaving it in would make ``_coerce_input`` re-raise
+                #     the same enum-shape error re-framed as an "invalid default"
+                #     (a confusing duplicate).
+                # Removing *only* ``enum`` (rather than skipping the check
+                # entirely) preserves the default's type validation: a
+                # ``type: string`` input with ``default: 5, enum: 5`` still
+                # reports the wrong-typed default alongside the enum error,
+                # instead of hiding it.
+                strip_enum = is_auto_integration or not enum_is_valid
+                validation_input_def: dict[str, Any] = input_def
+                if strip_enum and "enum" in input_def:
+                    validation_input_def = {
+                        key: value
+                        for key, value in input_def.items()
+                        if key != "enum"
+                    }
+                try:
+                    WorkflowEngine._coerce_input(
+                        input_name, default_value, validation_input_def
+                    )
+                except ValueError as exc:
+                    errors.append(
+                        f"Input {input_name!r} has invalid default: {exc}"
+                    )
+
+    # -- Requires ---------------------------------------------------------
+    # ``requires`` declares advisory pre-conditions (the spec-kit version and
+    # integrations a workflow expects). Only a fixed set of keys is recognized;
+    # reject anything else so authoring typos surface here instead of being
+    # silently ignored at runtime. In particular ``requires.permissions`` is
+    # rejected explicitly: it reads like a runtime capability gate, but no such
+    # gate exists — a ``shell`` step always runs with the user's privileges, so
+    # declaring it would give a false sense of sandboxing.
+    #
+    # Mirror ``inputs`` validation: an omitted block defaults to ``{}`` and is
+    # valid, but any present-but-non-mapping value — ``requires:`` (YAML null),
+    # ``requires: []`` or ``requires: ''`` — is an authoring error and must
+    # surface here rather than be silently ignored at runtime.
+    if not isinstance(definition.requires, dict):
+        errors.append("'requires' must be a mapping (or omitted).")
+    else:
+        for key in definition.requires:
+            if key == "permissions":
+                errors.append(
+                    "'requires.permissions' is not a recognized or "
+                    "enforced capability gate — shell steps always run "
+                    "with the user's privileges. Remove it and gate "
+                    "sensitive steps with a 'gate' step instead."
+                )
+            elif key not in _RECOGNIZED_REQUIRES_KEYS:
+                errors.append(
+                    f"Unknown 'requires' key {key!r}. Recognized keys: "
+                    f"{', '.join(sorted(_RECOGNIZED_REQUIRES_KEYS))}."
                 )
 
     # -- Steps ------------------------------------------------------------
@@ -170,8 +316,14 @@ def _validate_steps(
             continue
 
         step_id = step_config.get("id")
-        if not step_id:
+        if step_id is None or step_id == "":
             errors.append("Step is missing 'id' field.")
+            continue
+        if not isinstance(step_id, str):
+            errors.append(
+                f"Step ID must be a string, got "
+                f"{type(step_id).__name__} ({step_id!r})."
+            )
             continue
 
         if ":" in step_id:
@@ -197,6 +349,56 @@ def _validate_steps(
         if step_impl:
             step_errors = step_impl.validate(step_config)
             errors.extend(step_errors)
+
+        # Validate optional `continue_on_error` field. The engine honours
+        # this on any step that returns StepStatus.FAILED so the pipeline can route
+        # around the failure via a downstream `if` or `switch` (or a
+        # `gate` that surfaces the failure to the operator via message
+        # interpolation). The field must be a literal boolean —
+        # coercion from truthy strings is deliberately not supported so
+        # authoring mistakes surface at validation time rather than
+        # silently changing run semantics.
+        if "continue_on_error" in step_config:
+            coe = step_config["continue_on_error"]
+            if not isinstance(coe, bool):
+                errors.append(
+                    f"Step {step_id!r}: 'continue_on_error' must be a "
+                    f"boolean, got {type(coe).__name__}."
+                )
+
+        # Fan-in: every wait_for id must reference a step declared at or before
+        # this point. An id not yet seen is either a typo (unknown step) or a
+        # forward reference (the target runs after this fan-in, so its results
+        # cannot exist yet) — both are wiring errors that previously surfaced as
+        # a silent empty result + COMPLETED. A step that is declared but only
+        # conditionally executed (e.g. inside an if/switch branch) is still
+        # "seen" here, so a legitimately-empty result at runtime stays valid.
+        if step_type == "fan-in":
+            wait_for = step_config.get("wait_for")
+            if isinstance(wait_for, list):
+                for wid in wait_for:
+                    if not isinstance(wid, str):
+                        # A non-string entry (e.g. YAML `wait_for: [123]`) can
+                        # never match a real step id, so the join is silently
+                        # empty at runtime — surface it as a wiring error.
+                        errors.append(
+                            f"Fan-in step {step_id!r}: 'wait_for' entries must "
+                            f"be step-id strings, got {type(wid).__name__} "
+                            f"({wid!r})."
+                        )
+                    elif wid == step_id:
+                        # The fan-in's own id is already in seen_ids by now, so
+                        # a self-reference would pass the membership check below
+                        # while still producing an empty join at runtime.
+                        errors.append(
+                            f"Fan-in step {step_id!r}: 'wait_for' references "
+                            f"itself; a fan-in cannot wait for its own results."
+                        )
+                    elif wid not in seen_ids:
+                        errors.append(
+                            f"Fan-in step {step_id!r}: 'wait_for' references "
+                            f"unknown or not-yet-declared step id {wid!r}."
+                        )
 
         # Recursively validate nested steps
         for nested_key in ("then", "else", "steps"):
@@ -231,23 +433,119 @@ def _validate_steps(
 class RunState:
     """Manages workflow run state for persistence and resume."""
 
+    # ``run_id`` is interpolated into a filesystem path (``runs/<run_id>``)
+    # by both ``save()`` and ``load()``. Constrain it to a charset that
+    # cannot contain path separators (``/`` ``\``), parent-directory
+    # segments (``..``), or NULs — anything that could escape the
+    # ``.specify/workflows/runs/`` directory or be mis-interpreted by the
+    # filesystem. The first-character anchor blocks IDs that start with
+    # ``-`` (which would be mistaken for a CLI flag in error messages
+    # and shell completions).
+    _RUN_ID_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
+
+    @classmethod
+    def _validate_run_id(cls, run_id: str) -> None:
+        """Raise ``ValueError`` if ``run_id`` is not a safe path component.
+
+        This is the single source of truth for what counts as a valid
+        ``run_id``. ``__init__`` calls it to reject malformed IDs at
+        construction time; ``load`` calls it *before* interpolating the
+        ID into a path so a malicious value cannot probe or read files
+        outside ``.specify/workflows/runs/<run_id>/``.
+        """
+        if not isinstance(run_id, str) or not cls._RUN_ID_PATTERN.fullmatch(run_id):
+            raise ValueError(
+                f"Invalid run_id {run_id!r}: must be alphanumeric with "
+                "hyphens/underscores only (and must start with an "
+                "alphanumeric character)."
+            )
+
+    @staticmethod
+    def _validate_installed_origin(
+        installed_workflow_id: str | None,
+        installed_registry_root: str | None,
+    ) -> None:
+        """Validate persisted installed-workflow ownership metadata."""
+        if installed_workflow_id is not None:
+            if not isinstance(installed_workflow_id, str):
+                raise ValueError(
+                    "Invalid run state: 'installed_workflow_id' must be a "
+                    f"string or null, got {type(installed_workflow_id).__name__}"
+                )
+            if not _ID_PATTERN.fullmatch(installed_workflow_id):
+                raise ValueError(
+                    "Invalid run state: 'installed_workflow_id' must be a "
+                    "lowercase alphanumeric workflow ID with hyphens"
+                )
+        if installed_registry_root is not None:
+            if not isinstance(installed_registry_root, str):
+                raise ValueError(
+                    "Invalid run state: 'installed_registry_root' must be a "
+                    f"string or null, got {type(installed_registry_root).__name__}"
+                )
+            if not installed_registry_root or not Path(
+                installed_registry_root
+            ).is_absolute():
+                raise ValueError(
+                    "Invalid run state: 'installed_registry_root' must be "
+                    "an absolute path or null"
+                )
+            if installed_workflow_id is None:
+                raise ValueError(
+                    "Invalid run state: 'installed_registry_root' requires "
+                    "'installed_workflow_id'"
+                )
+
     def __init__(
         self,
         run_id: str | None = None,
         workflow_id: str = "",
         project_root: Path | None = None,
+        installed_workflow_id: str | None = None,
+        installed_registry_root: str | None = None,
+        installed_origin_tracked: bool = True,
     ) -> None:
-        self.run_id = run_id or str(uuid.uuid4())[:8]
-        if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9_-]*$', self.run_id):
-            msg = f"Invalid run_id {self.run_id!r}: must be alphanumeric with hyphens/underscores only."
-            raise ValueError(msg)
+        # ``run_id is None`` (omitted) → auto-generate. An explicit empty
+        # string is *not* the same as "omitted" and must be validated like
+        # any other caller-provided value — otherwise ``__init__("")``
+        # would silently substitute a UUID while ``load("")`` rejects, and
+        # the two entry points would diverge on the empty-string vector.
+        if run_id is None:
+            self.run_id = str(uuid.uuid4())[:8]
+        else:
+            self.run_id = run_id
+        self._validate_run_id(self.run_id)
+        self._validate_installed_origin(
+            installed_workflow_id, installed_registry_root
+        )
         self.workflow_id = workflow_id
         self.project_root = project_root or Path(".")
+        # Identifies the installed workflow (if any) this run was started
+        # from, and the project root that owns its registry — set by
+        # execute() when the source was resolved to an installed ID (see
+        # workflow_run's ownership mapping). None for a direct/non-installed
+        # YAML source. ``installed_origin_tracked`` distinguishes those
+        # explicit None values from legacy state files that predate both
+        # fields, allowing the CLI to conservatively infer same-project
+        # registry ownership before resuming.
+        self.installed_workflow_id = installed_workflow_id
+        self.installed_registry_root = installed_registry_root
+        self.installed_origin_tracked = installed_origin_tracked
         self.status = RunStatus.CREATED
         self.current_step_index = 0
         self.current_step_id: str | None = None
         self.step_results: dict[str, dict[str, Any]] = {}
+        # Guards step_results mutation and save() so a concurrent fan-out cannot
+        # mutate the dict while save() is serializing it (which would raise
+        # "dictionary changed size during iteration").
+        self._lock = threading.Lock()
+        # Serializes append_log's list append + log.jsonl write so concurrent
+        # fan-out workers cannot interleave or corrupt log lines. Kept separate
+        # from _lock so frequent logging never contends with state saves; since
+        # append_log is never called while _lock is held, the two never nest.
+        self._log_lock = threading.Lock()
         self.inputs: dict[str, Any] = {}
+        self.workflow_dir: str | None = None
         self.created_at = datetime.now(timezone.utc).isoformat()
         self.updated_at = self.created_at
         self.log_entries: list[dict[str, Any]] = []
@@ -256,32 +554,92 @@ class RunState:
     def runs_dir(self) -> Path:
         return self.project_root / ".specify" / "workflows" / "runs" / self.run_id
 
+    def record_step_result(self, step_id: str, data: dict[str, Any]) -> None:
+        """Record one step's result under the run lock.
+
+        Routing the mutation through the lock keeps it from racing a concurrent
+        ``save()`` that is iterating ``step_results`` (e.g. during a concurrent
+        fan-out). For a sequential run this is an uncontended lock.
+        """
+        with self._lock:
+            self.step_results[step_id] = data
+
+    def set_step_output(self, step_id: str, output: Any) -> None:
+        """Replace an already-recorded step's ``output`` under the run lock.
+
+        Fan-out updates its parent step's output after the items have run;
+        routing that nested mutation through the lock keeps it from racing a
+        ``save()`` serializing ``step_results`` — the same invariant
+        ``record_step_result`` provides for the top-level assignment.
+        """
+        with self._lock:
+            if step_id in self.step_results:
+                self.step_results[step_id]["output"] = output
+
     def save(self) -> None:
-        """Persist current state to disk."""
-        self.updated_at = datetime.now(timezone.utc).isoformat()
+        """Persist current state to disk.
+
+        Held under the run lock and written atomically (temp file + ``os.replace``)
+        so a concurrent fan-out can neither mutate ``step_results`` mid-serialization
+        nor leave a reader observing a half-written file. Racing writers only
+        contend to be last; they never corrupt.
+        """
         runs_dir = self.runs_dir
         runs_dir.mkdir(parents=True, exist_ok=True)
 
-        state_data = {
-            "run_id": self.run_id,
-            "workflow_id": self.workflow_id,
-            "status": self.status.value,
-            "current_step_index": self.current_step_index,
-            "current_step_id": self.current_step_id,
-            "step_results": self.step_results,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-        }
-        with open(runs_dir / "state.json", "w", encoding="utf-8") as f:
-            json.dump(state_data, f, indent=2)
+        with self._lock:
+            # Stamp updated_at inside the lock so the timestamp matches the
+            # snapshot this thread serializes (concurrent savers don't race it).
+            self.updated_at = datetime.now(timezone.utc).isoformat()
+            state_data = {
+                "run_id": self.run_id,
+                "workflow_id": self.workflow_id,
+                "installed_workflow_id": self.installed_workflow_id,
+                "installed_registry_root": self.installed_registry_root,
+                "status": self.status.value,
+                "current_step_index": self.current_step_index,
+                "current_step_id": self.current_step_id,
+                "step_results": self.step_results,
+                "workflow_dir": self.workflow_dir,
+                "created_at": self.created_at,
+                "updated_at": self.updated_at,
+            }
+            self._atomic_write_json(runs_dir / "state.json", state_data)
+            self._atomic_write_json(runs_dir / "inputs.json", {"inputs": self.inputs})
 
-        inputs_data = {"inputs": self.inputs}
-        with open(runs_dir / "inputs.json", "w", encoding="utf-8") as f:
-            json.dump(inputs_data, f, indent=2)
+    @staticmethod
+    def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
+        """Write *data* as indented JSON to *path* atomically (temp + ``os.replace``)."""
+        fd, tmp = tempfile.mkstemp(
+            dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     @classmethod
     def load(cls, run_id: str, project_root: Path) -> RunState:
-        """Load a run state from disk."""
+        """Load a run state from disk.
+
+        Validates ``run_id`` against ``_RUN_ID_PATTERN`` *before* building
+        the lookup path. Without this guard, a caller passing a value like
+        ``../escape`` (e.g. via ``specify workflow resume`` CLI argument)
+        would interpolate path-traversal segments into
+        ``runs_dir`` below, letting ``state_path.exists()`` probe arbitrary
+        paths and ``json.load`` read attacker-planted JSON from outside
+        the project's ``runs/`` directory. ``__init__`` already runs this
+        check on the stored ``state_data["run_id"]``, but that fires
+        *after* the file lookup — too late to prevent the disclosure.
+        Mirrors the precedent in ``agents._ensure_within_directory``.
+        """
+        cls._validate_run_id(run_id)
         runs_dir = project_root / ".specify" / "workflows" / "runs" / run_id
         state_path = runs_dir / "state.json"
         if not state_path.exists():
@@ -290,16 +648,52 @@ class RunState:
 
         with open(state_path, encoding="utf-8") as f:
             state_data = json.load(f)
+        if not isinstance(state_data, dict):
+            raise ValueError("Invalid run state: expected a JSON object")
+        missing_fields = [
+            field
+            for field in ("run_id", "workflow_id", "status")
+            if field not in state_data
+        ]
+        if missing_fields:
+            raise ValueError(
+                "Invalid run state: missing required field(s): "
+                + ", ".join(missing_fields)
+            )
+
+        workflow_id = state_data["workflow_id"]
+        if not isinstance(workflow_id, str) or not _ID_PATTERN.fullmatch(
+            workflow_id
+        ):
+            raise ValueError(
+                "Invalid run state: 'workflow_id' must be a lowercase "
+                "alphanumeric workflow ID with hyphens"
+            )
+
+        has_installed_workflow_id = "installed_workflow_id" in state_data
+        has_installed_registry_root = "installed_registry_root" in state_data
+        if has_installed_workflow_id != has_installed_registry_root:
+            raise ValueError(
+                "Invalid run state: installed workflow origin fields must "
+                "either both be present or both be absent"
+            )
+
+        installed_workflow_id = state_data.get("installed_workflow_id")
+        installed_registry_root = state_data.get("installed_registry_root")
 
         state = cls(
             run_id=state_data["run_id"],
-            workflow_id=state_data["workflow_id"],
+            workflow_id=workflow_id,
             project_root=project_root,
+            installed_workflow_id=installed_workflow_id,
+            installed_registry_root=installed_registry_root,
+            installed_origin_tracked=has_installed_workflow_id,
         )
         state.status = RunStatus(state_data["status"])
         state.current_step_index = state_data.get("current_step_index", 0)
         state.current_step_id = state_data.get("current_step_id")
         state.step_results = state_data.get("step_results", {})
+        state.workflow_dir = state_data.get("workflow_dir")
         state.created_at = state_data.get("created_at", "")
         state.updated_at = state_data.get("updated_at", "")
 
@@ -307,19 +701,32 @@ class RunState:
         if inputs_path.exists():
             with open(inputs_path, encoding="utf-8") as f:
                 inputs_data = json.load(f)
-            state.inputs = inputs_data.get("inputs", {})
+            if not isinstance(inputs_data, dict):
+                raise ValueError(
+                    "Invalid run inputs: expected a JSON object"
+                )
+            inputs = inputs_data.get("inputs", {})
+            if not isinstance(inputs, dict):
+                raise ValueError(
+                    "Invalid run inputs: 'inputs' must be a JSON object"
+                )
+            state.inputs = inputs
 
         return state
 
     def append_log(self, entry: dict[str, Any]) -> None:
-        """Append a log entry to the run log."""
-        entry["timestamp"] = datetime.now(timezone.utc).isoformat()
-        self.log_entries.append(entry)
+        """Append a log entry to the run log.
 
+        Held under ``_log_lock`` so concurrent fan-out workers serialize their
+        list append and ``log.jsonl`` write rather than interleaving lines.
+        """
+        entry["timestamp"] = datetime.now(timezone.utc).isoformat()
         runs_dir = self.runs_dir
         runs_dir.mkdir(parents=True, exist_ok=True)
-        with open(runs_dir / "log.jsonl", "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + "\n")
+        with self._log_lock:
+            self.log_entries.append(entry)
+            with open(runs_dir / "log.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
 
 
 # -- Workflow Engine ------------------------------------------------------
@@ -331,6 +738,10 @@ class WorkflowEngine:
     def __init__(self, project_root: Path | None = None) -> None:
         self.project_root = project_root or Path(".")
         self.on_step_start: Any = None  # Callable[[str, str], None] | None
+        # Serializes on_step_start so a concurrent fan-out can't interleave the
+        # callback's output (the CLI sets it to a console.print lambda). Uncontended
+        # for sequential runs.
+        self._callback_lock = threading.Lock()
 
     def load_workflow(self, source: str | Path) -> WorkflowDefinition:
         """Load a workflow from an installed ID or a local YAML path.
@@ -353,13 +764,24 @@ class WorkflowEngine:
         ValueError:
             If the workflow YAML is invalid.
         """
-        path = Path(source)
+        from .overlays import WorkflowResolver
+
+        path = Path(source).expanduser()
 
         # Try as a direct file path first
-        if path.suffix in (".yml", ".yaml") and path.exists():
+        if path.suffix.lower() in (".yml", ".yaml") and path.is_file():
             return WorkflowDefinition.from_yaml(path)
 
-        # Try as an installed workflow ID
+        # Try as an installed workflow ID, resolving any overlays.
+        resolver = WorkflowResolver(self.project_root)
+        try:
+            return resolver.resolve(str(source))
+        except FileNotFoundError:
+            # Fall back to the direct workflow.yml path so callers still get
+            # the original error when the workflow id is not installed.
+            pass
+
+        # Legacy direct path check for workflows installed without registry entries.
         installed_path = (
             self.project_root
             / ".specify"
@@ -382,6 +804,8 @@ class WorkflowEngine:
         definition: WorkflowDefinition,
         inputs: dict[str, Any] | None = None,
         run_id: str | None = None,
+        installed_workflow_id: str | None = None,
+        installed_registry_root: Path | None = None,
     ) -> RunState:
         """Execute a workflow definition.
 
@@ -392,7 +816,13 @@ class WorkflowEngine:
         inputs:
             User-provided input values.
         run_id:
-            Optional run ID (auto-generated if not provided).
+            Optional run ID (uses SPECKIT_WORKFLOW_RUN_ID when set, otherwise auto-generated).
+        installed_workflow_id, installed_registry_root:
+            When the run was started from an installed workflow (as opposed
+            to a direct/non-installed YAML source), identifies it and its
+            owning registry root so a later ``resume`` can re-check the
+            registry's current disabled state before continuing — see
+            ``workflow_resume``.
 
         Returns
         -------
@@ -400,10 +830,22 @@ class WorkflowEngine:
         """
         from . import STEP_REGISTRY
 
+        effective_run_id = run_id
+        if effective_run_id is None:
+            env_run_id = os.environ.get("SPECKIT_WORKFLOW_RUN_ID", "").strip()
+            if env_run_id:
+                effective_run_id = env_run_id
+
         state = RunState(
-            run_id=run_id,
+            run_id=effective_run_id,
             workflow_id=definition.id,
             project_root=self.project_root,
+            installed_workflow_id=installed_workflow_id,
+            installed_registry_root=(
+                str(installed_registry_root)
+                if installed_registry_root is not None
+                else None
+            ),
         )
 
         # Persist a copy of the workflow definition so resume can
@@ -419,6 +861,12 @@ class WorkflowEngine:
         # Resolve inputs
         resolved_inputs = self._resolve_inputs(definition, inputs or {})
         state.inputs = resolved_inputs
+        workflow_dir = (
+            str(definition.source_path.resolve().parent)
+            if definition.source_path is not None
+            else None
+        )
+        state.workflow_dir = workflow_dir
         state.status = RunStatus.RUNNING
         state.save()
 
@@ -429,6 +877,7 @@ class WorkflowEngine:
             default_options=definition.default_options,
             project_root=str(self.project_root),
             run_id=state.run_id,
+            workflow_dir=workflow_dir,
         )
 
         # Execute steps
@@ -451,8 +900,19 @@ class WorkflowEngine:
         state.save()
         return state
 
-    def resume(self, run_id: str) -> RunState:
-        """Resume a paused or failed workflow run."""
+    def resume(
+        self,
+        run_id: str,
+        inputs: dict[str, Any] | None = None,
+    ) -> RunState:
+        """Resume a paused or failed workflow run.
+
+        When ``inputs`` is provided, the values are merged over the run's
+        persisted inputs and re-resolved through the same typed validation
+        path used by :meth:`execute`, so the resumed step sees updated
+        workflow inputs. Keys not supplied keep their persisted values; an
+        empty/``None`` ``inputs`` leaves the run's inputs unchanged.
+        """
         state = RunState.load(run_id, self.project_root)
         if state.status not in (RunStatus.PAUSED, RunStatus.FAILED):
             msg = f"Cannot resume run {run_id!r} with status {state.status.value!r}."
@@ -468,6 +928,12 @@ class WorkflowEngine:
         else:
             definition = self.load_workflow(state.workflow_id)
 
+        # Merge any newly-supplied inputs over the persisted ones and
+        # re-validate through the same typing path as the initial run.
+        if inputs:
+            merged = {**state.inputs, **inputs}
+            state.inputs = self._resolve_inputs(definition, merged)
+
         # Restore context
         context = StepContext(
             inputs=state.inputs,
@@ -477,6 +943,7 @@ class WorkflowEngine:
             default_options=definition.default_options,
             project_root=str(self.project_root),
             run_id=state.run_id,
+            workflow_dir=state.workflow_dir,
         )
 
         from . import STEP_REGISTRY
@@ -511,6 +978,22 @@ class WorkflowEngine:
         state.save()
         return state
 
+    @staticmethod
+    def _record_result(
+        context: StepContext, state: RunState, step_id: str, data: dict[str, Any]
+    ) -> None:
+        """Record a step result into both the live context and persistent state.
+
+        ``record_step_result`` writes ``state.step_results`` under the run lock.
+        On a resume run ``context.steps`` *is* that same dict, so that locked
+        write is the only one needed; mirror into ``context.steps`` separately
+        only when it is a distinct object (a fresh run), to avoid an unlocked
+        mutation of the shared dict that could race a concurrent ``save()``.
+        """
+        if context.steps is not state.step_results:
+            context.steps[step_id] = data
+        state.record_step_result(step_id, data)
+
     def _execute_steps(
         self,
         steps: list[dict[str, Any]],
@@ -538,7 +1021,8 @@ class WorkflowEngine:
             # otherwise stay silent (library-safe default).
             label = step_config.get("command", "") or step_type
             if self.on_step_start is not None:
-                self.on_step_start(step_id, label)
+                with self._callback_lock:
+                    self.on_step_start(step_id, label)
 
             step_impl = registry.get(step_type)
             if not step_impl:
@@ -557,6 +1041,7 @@ class WorkflowEngine:
 
             # Record step results — prefer resolved values from step output
             step_data = {
+                "type": step_type,
                 "integration": result.output.get("integration")
                 or step_config.get("integration")
                 or context.default_integration,
@@ -570,8 +1055,7 @@ class WorkflowEngine:
                 "output": result.output,
                 "status": result.status.value,
             }
-            context.steps[step_id] = step_data
-            state.step_results[step_id] = step_data
+            self._record_result(context, state, step_id, step_data)
 
             state.append_log(
                 {
@@ -589,7 +1073,10 @@ class WorkflowEngine:
 
             # Handle failures
             if result.status == StepStatus.FAILED:
-                # Gate abort (output.aborted) maps to ABORTED status
+                # Gate abort (output.aborted) maps to ABORTED status.
+                # Aborts are deliberate operator decisions, so
+                # `continue_on_error` does NOT override them — that flag
+                # is for transient/expected step failures only.
                 if result.output.get("aborted"):
                     state.status = RunStatus.ABORTED
                     state.append_log(
@@ -598,15 +1085,49 @@ class WorkflowEngine:
                             "step_id": step_id,
                         }
                     )
-                else:
-                    state.status = RunStatus.FAILED
+                    state.save()
+                    return
+
+                # `continue_on_error: true` lets the pipeline route
+                # around the failure instead of halting. The step
+                # result (including exit_code, stderr, status) is
+                # still recorded so a downstream `if` or `switch`
+                # can branch on it (or a `gate` can surface it to the
+                # operator via message interpolation). Log a single,
+                # unambiguous event per failure resolution — either
+                # the run continued past it, or it halted.
+                #
+                # Use identity comparison (`is True`) rather than
+                # truthiness so that only a literal boolean enables
+                # the behaviour, even if validation was skipped.
+                # Validation rejects non-bool values at parse time,
+                # but `WorkflowEngine.execute()` does not auto-validate
+                # (see `WorkflowEngine.load_workflow`, whose docstring
+                # explicitly notes "not yet validated; call
+                # `validate_workflow()` or `engine.validate()`
+                # separately"), so a caller passing an unvalidated
+                # definition could otherwise see truthy non-bool
+                # values like the string `"true"` silently change
+                # run semantics.
+                if step_config.get("continue_on_error") is True:
                     state.append_log(
                         {
-                            "event": "step_failed",
+                            "event": "step_continue_on_error",
                             "step_id": step_id,
                             "error": result.error,
                         }
                     )
+                    state.save()
+                    continue
+
+                state.status = RunStatus.FAILED
+                state.append_log(
+                    {
+                        "event": "step_failed",
+                        "step_id": step_id,
+                        "error": result.error,
+                    }
+                )
                 state.save()
                 return
 
@@ -633,61 +1154,69 @@ class WorkflowEngine:
                     from .expressions import evaluate_condition
 
                     max_iters = step_config.get("max_iterations")
-                    if not isinstance(max_iters, int) or max_iters < 1:
+                    # A bool is an int in Python (isinstance(True, int) is True
+                    # and True == 1), so a bool max_iterations would slip past
+                    # the int check and cap the loop at range(0)==1 iteration
+                    # instead of the default. Exclude bools, mirroring the
+                    # while/do-while validators and the continue_on_error guard.
+                    if (
+                        isinstance(max_iters, bool)
+                        or not isinstance(max_iters, int)
+                        or max_iters < 1
+                    ):
                         max_iters = 10
                     condition = step_config.get("condition", False)
                     for _loop_iter in range(max_iters - 1):
                         if not evaluate_condition(condition, context):
                             break
                         # Namespace nested step IDs per iteration
-                        iter_steps = []
-                        for ns in result.next_steps:
+                        # so logs and state keys are unique.
+                        # Execute one step at a time and alias each
+                        # result back to the unprefixed key so that
+                        # later steps in the same body and the loop
+                        # condition see the latest values.
+                        for ns_idx, ns in enumerate(result.next_steps):
                             ns_copy = dict(ns)
-                            if "id" in ns_copy:
-                                ns_copy["id"] = f"{step_id}:{ns_copy['id']}:{_loop_iter + 1}"
-                            iter_steps.append(ns_copy)
-                        self._execute_steps(
-                            iter_steps, context, state, registry,
-                            step_offset=-1,
-                        )
-                        if state.status in (
-                            RunStatus.PAUSED,
-                            RunStatus.FAILED,
-                            RunStatus.ABORTED,
-                        ):
-                            return
+                            orig = ns_copy.get("id")
+                            base_id = orig or f"step-{ns_idx}"
+                            ns_copy["id"] = f"{step_id}:{base_id}:{_loop_iter + 1}"
+                            self._execute_steps(
+                                [ns_copy], context, state, registry,
+                                step_offset=-1,
+                            )
+                            if state.status in (
+                                RunStatus.PAUSED,
+                                RunStatus.FAILED,
+                                RunStatus.ABORTED,
+                            ):
+                                return
+                            if orig and ns_copy["id"] in context.steps:
+                                self._record_result(
+                                    context, state, orig,
+                                    context.steps[ns_copy["id"]],
+                                )
 
-            # Fan-out: execute nested step template per item with unique IDs
+            # Fan-out: execute the nested step template once per item. Honors
+            # max_concurrency — <=1 runs sequentially (default, historical
+            # behavior); >1 runs up to that many items concurrently. Either way
+            # results are assembled in item order under the
+            # parentId:templateId:index id grammar.
             if step_type == "fan-out":
                 items = result.output.get("items", [])
                 template = result.output.get("step_template", {})
                 if template and items:
-                    fan_out_results = []
-                    for item_idx, item_val in enumerate(result.output["items"]):
-                        context.item = item_val
-                        # Per-item ID: parentId:templateId:index
-                        item_step = dict(template)
-                        base_id = item_step.get("id", "item")
-                        item_step["id"] = f"{step_id}:{base_id}:{item_idx}"
-                        self._execute_steps(
-                            [item_step], context, state, registry,
-                            step_offset=-1,
-                        )
-                        # Collect per-item result for fan-in
-                        item_result = context.steps.get(item_step["id"], {})
-                        fan_out_results.append(item_result.get("output", {}))
-                        if state.status in (
-                            RunStatus.PAUSED,
-                            RunStatus.FAILED,
-                            RunStatus.ABORTED,
-                        ):
-                            break
+                    fan_out_results = self._run_fan_out(
+                        items, template, step_id, context, state, registry,
+                        result.output.get("max_concurrency", 1),
+                    )
                     context.item = None
                     # Preserve original output and add collected results
                     fan_out_output = dict(result.output)
                     fan_out_output["results"] = fan_out_results
-                    context.steps[step_id]["output"] = fan_out_output
-                    state.step_results[step_id]["output"] = fan_out_output
+                    # set_step_output updates the recorded dict under the run lock;
+                    # context.steps[step_id] is that same object, so it reflects the
+                    # change too — no separate (unlocked) context mutation needed.
+                    state.set_step_output(step_id, fan_out_output)
                     if state.status in (
                         RunStatus.PAUSED,
                         RunStatus.FAILED,
@@ -697,8 +1226,172 @@ class WorkflowEngine:
                 else:
                     # Empty items or no template — normalize output
                     result.output["results"] = []
-                    context.steps[step_id]["output"] = result.output
-                    state.step_results[step_id]["output"] = result.output
+                    state.set_step_output(step_id, result.output)
+
+    def _run_fan_out(
+        self,
+        items: list[Any],
+        template: dict[str, Any],
+        step_id: str,
+        context: StepContext,
+        state: RunState,
+        registry: dict[str, Any],
+        max_concurrency: Any,
+    ) -> list[Any]:
+        """Run a fan-out template once per item; return per-item outputs in item order.
+
+        ``max_concurrency`` <= 1 (the default) runs items sequentially, identical
+        to the historical fan-out behavior. ``max_concurrency`` > 1 runs items on a
+        bounded thread pool using a sliding submission window of that size: at most
+        that many items are ever in flight, and no new item is launched once the run
+        has reached a halting status, so a halt cannot keep starting queued work.
+
+        Results are always returned in item order (never completion order). On a
+        halt (PAUSED/FAILED/ABORTED) the returned prefix is the items up to and
+        including the first item *in item order* whose own execution halted the run
+        — identical to the sequential path. Later items that have not yet started
+        are cancelled; any already running are allowed to finish but their outputs
+        are ignored. Halt is attributed per item from that item's recorded result
+        (not the shared run status, which a concurrently-running later item may have
+        already flipped), so the prefix never drops the actual halting item.
+
+        ``max_concurrency`` is coerced with ``int()``; a value that cannot be
+        coerced (``None``, a non-numeric string, ``.inf``/``.nan``, …) or that
+        coerces to <= 1 runs sequentially, while a numeric string like ``"4"`` or
+        a float like ``4.0`` is honored.
+        """
+        if not items:
+            return []
+
+        halting = (RunStatus.PAUSED, RunStatus.FAILED, RunStatus.ABORTED)
+        try:
+            workers = max(1, int(max_concurrency))
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError: int(float("inf")) — a YAML ``max_concurrency: .inf``
+            # would otherwise crash the whole run instead of falling back.
+            workers = 1
+        # Never spin up more workers than there is work — bounds a user-controlled
+        # max_concurrency from over-allocating threads.
+        workers = min(workers, len(items))
+
+        base_id = template.get("id", "item")
+
+        def item_id(idx: int) -> str:
+            # Per-item ID grammar: parentId:templateId:index.
+            return f"{step_id}:{base_id}:{idx}"
+
+        def run_item(idx: int, item_ctx: StepContext) -> Any:
+            item_step = dict(template)
+            item_step["id"] = item_id(idx)
+            self._execute_steps(
+                [item_step], item_ctx, state, registry, step_offset=-1,
+            )
+            # Read back through the context that was actually executed against,
+            # not the outer closure — clearer and robust if StepContext copying
+            # ever stops sharing the steps dict by reference.
+            return item_ctx.steps.get(item_step["id"], {}).get("output", {})
+
+        # Sequential path — identical to the historical behavior.
+        if workers <= 1:
+            results: list[Any] = []
+            for item_idx, item_val in enumerate(items):
+                context.item = item_val
+                results.append(run_item(item_idx, context))
+                if state.status in halting:
+                    break
+            return results
+
+        # Concurrent path — bounded sliding window; results assembled in item order.
+        n = len(items)
+        slots: list[Any] = [None] * n
+
+        def run_isolated(idx: int) -> Any:
+            # Each item runs against its own context copy so context.item is not
+            # clobbered across threads; the shared steps dict is written only on the
+            # disjoint parentId:templateId:index key (GIL-safe on distinct keys).
+            return run_item(idx, dataclasses.replace(context, item=items[idx]))
+
+        def item_halt_status(idx: int) -> RunStatus | None:
+            # If THIS item's own execution halted the run, return the resulting run
+            # status; else None. Decided from the item's own recorded result, not
+            # the shared run status, so a later item's concurrent halt is never
+            # misattributed here. Mirrors the sequential mapping: PAUSED -> PAUSED;
+            # FAILED -> ABORTED when aborted, else FAILED, unless continue_on_error
+            # routes around it.
+            rec = context.steps.get(item_id(idx))
+            if rec is None:
+                # Ran but recorded nothing — only when the item failed before
+                # record_step_result (e.g. an unknown step type returns early).
+                # Every item runs the same template, so the shared run status is
+                # this item's own outcome; attribute the halt to it.
+                return state.status if state.status in halting else None
+            status = rec.get("status")
+            if status == StepStatus.PAUSED.value:
+                return RunStatus.PAUSED
+            if status == StepStatus.FAILED.value:
+                out = rec.get("output") or {}
+                if out.get("aborted"):
+                    return RunStatus.ABORTED
+                if template.get("continue_on_error") is not True:
+                    return RunStatus.FAILED
+            return None
+
+        # (halting item index, its run status) once a halt is attributed.
+        halt: tuple[int, RunStatus] | None = None
+        collected = 0
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures: dict[int, Future] = {}
+            next_submit = 0
+            for idx in range(n):
+                # Refill the window: keep <= workers in flight, and stop launching
+                # new items once the run is halting so a halt cannot keep starting
+                # queued work. Already-submitted futures are still collected in
+                # item order below.
+                while (
+                    next_submit < n
+                    and len(futures) < workers
+                    and state.status not in halting
+                ):
+                    futures[next_submit] = pool.submit(run_isolated, next_submit)
+                    next_submit += 1
+
+                fut = futures.pop(idx, None)
+                if fut is None:
+                    # Safety net: the window submits indices in order and the loop
+                    # breaks at the first halting item, so every collected index has
+                    # an in-flight future. Stop cleanly rather than raise if a future
+                    # change ever breaks that invariant.
+                    break
+                try:
+                    slots[idx] = fut.result()
+                except Exception:
+                    # A genuine exception escaping a step (not a normal step
+                    # FAILED, which sets state.status) must not be masked: cancel
+                    # outstanding work and re-raise — with a bare ``raise`` so the
+                    # original traceback is preserved — so the engine marks the run
+                    # failed instead of reporting a vacuous completion. The pool's
+                    # __exit__ still joins any already-running workers.
+                    for other in futures.values():
+                        other.cancel()
+                    raise
+                collected = idx + 1
+                halt_status = item_halt_status(idx)
+                if halt_status is not None:
+                    # First halting item in item order: include it (slots[idx] is
+                    # already set), record its status, and cancel everything pending.
+                    halt = (idx, halt_status)
+                    for other in futures.values():
+                        other.cancel()
+                    break
+
+        if halt is not None:
+            halted_at, halted_status = halt
+            # A later in-flight item may have overwritten state.status before the
+            # pool joined; restore the halting item's own outcome so the final run
+            # status matches the sequential semantics.
+            state.status = halted_status
+            return slots[: halted_at + 1]
+        return slots[:collected]
 
     def _resolve_inputs(
         self,
@@ -707,19 +1400,91 @@ class WorkflowEngine:
     ) -> dict[str, Any]:
         """Resolve workflow inputs against definitions and provided values."""
         resolved: dict[str, Any] = {}
+        # execute()/resume() accept UNVALIDATED definitions (load_workflow does
+        # not validate). A non-mapping ``inputs:`` block (bare ``inputs:`` ->
+        # None, or ``inputs: []``) is stored raw, so iterating ``.items()`` here
+        # would crash the run with AttributeError. Treat a non-mapping inputs
+        # block as "no inputs"; validate_workflow reports the malformed shape
+        # via its own isinstance check.
+        if not isinstance(definition.inputs, dict):
+            return {}
         for name, input_def in definition.inputs.items():
             if not isinstance(input_def, dict):
                 continue
             if name in provided:
-                resolved[name] = self._coerce_input(
-                    name, provided[name], input_def
-                )
+                # Resolve sentinels for explicitly-provided values too: a
+                # caller passing ``{"integration": "auto"}`` (which the
+                # workflow prompt advertises as a valid value) must be
+                # treated identically to omitting the input and letting the
+                # default flow through, so dispatch never sees the literal
+                # sentinel.
+                value = self._resolve_default(name, provided[name])
             elif "default" in input_def:
-                resolved[name] = input_def["default"]
+                value = self._resolve_default(name, input_def["default"])
             elif input_def.get("required", False):
                 msg = f"Required input {name!r} not provided."
                 raise ValueError(msg)
+            else:
+                continue
+
+            # When the ``integration`` default could not be resolved against
+            # project state and falls back to the literal ``"auto"``
+            # sentinel, strip ``enum`` from the input definition before
+            # coercion so a workflow that lists specific integrations in
+            # ``enum`` does not crash at runtime on the sentinel value.
+            # NOTE: only enum-membership is skipped; ``_coerce_input``
+            # still enforces the declared ``type`` against the filtered
+            # definition (``string`` rejects non-strings, ``number`` rejects
+            # bools and uncoercible values, ``boolean`` rejects non-bools),
+            # so ill-typed values still fail fast here.
+            #
+            # ``execute()`` accepts unvalidated definitions, so a malformed
+            # (non-list) ``enum`` can reach here. Only strip a *list* ``enum``:
+            # a scalar/string ``enum`` must stay in the definition so
+            # ``_coerce_input`` raises the clean shape ``ValueError`` instead of
+            # being silently exempted by the ``auto`` membership skip (which
+            # would otherwise let ``enum: 5`` resolve successfully).
+            coerce_input_def = input_def
+            if (
+                name == "integration"
+                and value == "auto"
+                and isinstance(input_def.get("enum"), list)
+            ):
+                coerce_input_def = {
+                    key: val
+                    for key, val in input_def.items()
+                    if key != "enum"
+                }
+            resolved[name] = self._coerce_input(name, value, coerce_input_def)
         return resolved
+
+    def _resolve_default(self, name: str, default: Any) -> Any:
+        """Resolve special default sentinels against project state.
+
+        For the ``integration`` input, ``"auto"`` resolves to the integration
+        recorded in ``.specify/integration.json`` so workflows dispatch to the
+        AI the project was actually initialized with, instead of a hardcoded
+        value baked into the workflow YAML.
+        """
+        if name == "integration" and default == "auto":
+            resolved = self._load_project_integration()
+            if resolved is not None:
+                return resolved
+        return default
+
+    def _load_project_integration(self) -> str | None:
+        """Read the default integration key from ``.specify/integration.json``.
+
+        Delegates parsing and schema validation to
+        :func:`try_read_integration_json` — the same low-level helper used by
+        the CLI — so the engine cannot drift from CLI behavior on the parse
+        path. Returns ``None`` when the file is missing, malformed, or
+        written by a newer CLI; callers fall back to the literal default.
+        """
+        state, error = try_read_integration_json(self.project_root)
+        if state is None or error is not None:
+            return None
+        return default_integration_key(state)
 
     @staticmethod
     def _coerce_input(
@@ -729,12 +1494,40 @@ class WorkflowEngine:
         input_type = input_def.get("type", "string")
         enum_values = input_def.get("enum")
 
+        # ``enum`` must be a list. A scalar (``enum: 5``, ``enum: true``) makes
+        # the ``value not in enum_values`` membership test below raise a raw
+        # ``TypeError`` ("argument of type 'int' is not ... iterable"), which
+        # escapes ``validate_workflow``'s ``except ValueError`` and breaks its
+        # "return errors, never raise" contract — and crashes ``_resolve_inputs``
+        # outright at run time. A bare string is just as wrong: ``value in "abc"``
+        # is a silent substring/character test, not enum membership. Require a
+        # list so both forms fail fast with a clear message. ``None`` means "no
+        # enum" and is left alone.
+        if enum_values is not None and not isinstance(enum_values, list):
+            msg = (
+                f"Input {name!r} has invalid 'enum': must be a list, got "
+                f"{type(enum_values).__name__}."
+            )
+            raise ValueError(msg)
+
         if input_type == "number":
+            # Reject bools explicitly: ``bool`` is a subclass of ``int`` so
+            # ``float(True)`` succeeds and would silently coerce a YAML
+            # authoring mistake like ``type: number`` + ``default: true``
+            # into ``1``. Fail fast instead.
+            if isinstance(value, bool):
+                msg = f"Input {name!r} expected a number, got {value!r}."
+                raise ValueError(msg)
             try:
                 value = float(value)
                 if value == int(value):
                     value = int(value)
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, OverflowError):
+                # OverflowError: `int(value)` raises it for an infinite float
+                # (e.g. a `default: .inf` authoring mistake), which would
+                # otherwise escape validate_workflow's `except ValueError` and
+                # break its "return errors, never raise" contract. Surface it as
+                # the same clean "expected a number" error as NaN does.
                 msg = f"Input {name!r} expected a number, got {value!r}."
                 raise ValueError(msg) from None
         elif input_type == "boolean":
@@ -746,6 +1539,17 @@ class WorkflowEngine:
                 else:
                     msg = f"Input {name!r} expected a boolean, got {value!r}."
                     raise ValueError(msg)
+            elif not isinstance(value, bool):
+                msg = f"Input {name!r} expected a boolean, got {value!r}."
+                raise ValueError(msg)
+        elif input_type == "string":
+            # Without this, ``type: string`` accepts any Python value
+            # (numbers, lists, dicts) because nothing else rejects it —
+            # YAML ``default: 5`` would slip through. Require an actual
+            # string so authoring mistakes fail at resolve time.
+            if not isinstance(value, str):
+                msg = f"Input {name!r} expected a string, got {value!r}."
+                raise ValueError(msg)
 
         if enum_values is not None and value not in enum_values:
             msg = (

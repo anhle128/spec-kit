@@ -78,7 +78,7 @@ specify workflow run speckit \
 
 ## Step Types
 
-Workflows support 10 built-in step types:
+Workflows support 11 built-in step types:
 
 ### Command Steps (default)
 
@@ -111,7 +111,43 @@ Run a shell command and capture output:
 ```yaml
 - id: run-tests
   type: shell
-  run: "cd {{ inputs.project_dir }} && npm test"
+  run: "npm test"       # runs from the project root; no interpolation needed
+  timeout: 1800   # Optional: max seconds before the command is killed (default 300)
+```
+
+> ⚠️ **Constrain interpolated values in `run` fields.** A `run` field is executed
+> by the system shell, and `{{ ... }}` expressions are substituted as raw text
+> with no automatic quoting or escaping. An `inputs.*` value or prior-step output
+> (including AI-generated `prompt` output) is parsed as shell syntax and can
+> change the command that runs. The only reliable control is to restrict such a
+> value at the source with an `enum`/allowlist, or to keep values you cannot
+> constrain out of `run` entirely. Quoting a substitution helps a trusted value
+> survive word-splitting but is **not** a security boundary — there is no
+> shell-escaping filter, and a value containing the matching quote can still
+> break out. See
+> [Interpolation and shell safety](../docs/reference/workflows.md#interpolation-and-shell-safety).
+
+`timeout` is the maximum time in seconds the command may run before it is
+killed and the step fails; it must be a positive number and defaults to
+`300` (five minutes) when omitted. Raise it for long-running gates such as
+full builds, linter aggregators, or integration-test targets.
+
+### Init Steps
+
+Bootstrap a project the same way `specify init` does — scaffolding
+templates, scripts, shared infrastructure, and the selected coding agent
+integration. Runs non-interactively (defaults to `--ignore-agent-tools`)
+and resolves the integration from the step config or the workflow default:
+
+```yaml
+- id: bootstrap
+  type: init
+  here: true                 # or: project: my-project
+  integration: copilot       # Optional: defaults to workflow integration
+  integration_options: "--skills"  # Optional: extra options for the integration
+  script: sh                 # Optional: sh or ps
+  force: true                # Optional: required when target directory already exists
+  preset: healthcare-compliance   # Optional preset ID
 ```
 
 ### Gate Steps
@@ -219,6 +255,83 @@ Aggregate results from fan-out steps:
   output: {}
 ```
 
+## Error Handling
+
+By default, any step that returns `StepResult(status=StepStatus.FAILED, ...)`
+at runtime halts the entire run — most commonly a `shell` or
+`command` step exiting non-zero. Set `continue_on_error: true` on
+a step to record its result and continue to the next sibling step
+instead. When the failure was a non-zero exit, the exit code
+remains available on `steps.<id>.output.exit_code` so a downstream
+`if` or `switch` can branch on it (or a `gate` can surface it to
+the operator via `{{ }}` interpolation in `message`):
+
+```yaml
+- id: heavy-thing
+  type: command
+  integration: claude
+  command: speckit.heavy-thing
+  continue_on_error: true
+
+- id: check-result
+  type: if
+  condition: "{{ steps.heavy-thing.output.exit_code != 0 }}"
+  then:
+    - id: review
+      type: gate
+      message: "Step failed (exit {{ steps.heavy-thing.output.exit_code }}). Approve to run the recovery path, or reject to leave the failure recorded and move on."
+      on_reject: skip
+    - id: recover
+      type: if
+      condition: "{{ steps.review.output.choice == 'approve' }}"
+      then:
+        - id: rerun
+          command: speckit.recovery
+  else:
+    - id: next-thing
+      command: speckit.next-thing
+```
+
+A few things worth knowing about that example:
+
+- Both gate options (`approve`, `reject`) return `StepStatus.COMPLETED`;
+  `on_reject: skip` controls only whether the engine aborts on reject
+  (it doesn't, with `skip`) — it does **not** auto-skip subsequent
+  sibling steps in the `then:` list. Downstream branching is the
+  workflow author's responsibility: read
+  `{{ steps.<gate-id>.output.choice }}` in a follow-up `if`, `switch`,
+  or expression, as the `recover` step above does.
+- `on_reject` has three values: `abort` (default — reject → `StepStatus.FAILED`
+  with `output.aborted = True`, halts the run), `skip` (reject →
+  `StepStatus.COMPLETED`, author handles branching as shown), and `retry`
+  (reject → `StepStatus.PAUSED` so the next `specify workflow resume` re-runs
+  the gate).
+- Gates do not automatically re-run the failed step. To express a
+  retry path, either define custom gate options and branch on the
+  choice downstream, or wrap the failing step in your own loop.
+
+**Notes:**
+
+- The field must be a literal boolean (`true` / `false`); coerced
+  strings like `"true"` are rejected at validation time.
+- **Scope: returned failures only.** The flag applies to step results
+  with `status=StepStatus.FAILED`. Unhandled exceptions raised out of a step's
+  `execute()` method are caught one level up by `WorkflowEngine.execute()`,
+  logged as `workflow_failed`, and abort the run regardless of
+  `continue_on_error`. If a step author wants the flag to cover an
+  exceptional path, the step must catch the exception internally and
+  return `StepResult(status=StepStatus.FAILED, ...)` with the failure encoded in
+  `output` (e.g. `exit_code`, `stderr`, or a custom field).
+- Gate aborts (`on_reject: abort` chosen by the operator) always halt
+  the run — `continue_on_error` does not override them. The flag is
+  for transient/expected step failures, not for overriding deliberate
+  operator decisions.
+- Structural validation runs up-front: `specify workflow run` rejects
+  invalid workflow definitions before the run is created, so
+  validation failures never reach this code path.
+- When the flag is omitted, behaviour is byte-equivalent to before
+  this feature.
+
 ## Expressions
 
 Workflow definitions use `{{ expression }}` syntax for dynamic values:
@@ -237,7 +350,40 @@ condition: "{{ steps.run-tests.output.exit_code != 0 }}"
 message: "{{ status | default('pending') }}"
 ```
 
-Supported filters: `default`, `join`, `contains`, `map`.
+Supported filters: `default`, `join`, `contains`, `map`, `from_json`.
+
+### Runtime Context
+
+`{{ context.* }}` exposes engine-managed runtime metadata for the
+current run:
+
+| Variable | Description |
+|----------|-------------|
+| `context.run_id` | The current workflow run id (the same value Spec Kit prints as `Run ID:` at the end of `workflow run`). Auto-generated runs are 8-character hex from `uuid4`; operator-supplied ids may be any alphanumeric string with hyphens or underscores. Empty string outside a run context. |
+| `context.workflow_dir` | The resolved absolute path to the directory containing the workflow source file. For file-loaded workflows this is the parent directory of the YAML file; for installed-by-ID workflows it is the absolute path to the installation directory (e.g. `<project>/.specify/workflows/<id>/`); for string-loaded workflows it is an empty string. On resume the original source directory is preserved from the first execution. |
+
+```yaml
+# Stamp telemetry events with the run id for cross-system join.
+- id: emit-event
+  type: shell
+  run: 'echo "{\"run_id\":\"{{ context.run_id }}\",\"event\":\"started\"}" >> events.jsonl'
+
+# Per-run scratch directory.
+- id: prep-scratch
+  type: shell
+  run: 'mkdir -p /tmp/run-{{ context.run_id }}'
+
+# Pass run id into a command for artifact metadata.
+- id: tag-artifact
+  command: speckit.specify
+  input:
+    args: "{{ context.run_id }}"
+
+# Reference a sibling file shipped alongside the workflow definition.
+- id: apply-config
+  type: shell
+  run: 'cp "{{ context.workflow_dir }}/defaults.yml" ./config.yml'
+```
 
 ## Input Types
 
@@ -317,6 +463,7 @@ specify workflow catalog remove <index>
 | Variable | Description |
 |----------|-------------|
 | `SPECKIT_WORKFLOW_CATALOG_URL` | Override the catalog URL (replaces all defaults) |
+| `SPECKIT_WORKFLOW_DIR` | Set automatically for shell steps; contains the resolved absolute path to the workflow source directory (same value as `{{ context.workflow_dir }}`). Not set when the workflow has no source path (string-loaded workflows). |
 
 ## Configuration Files
 
