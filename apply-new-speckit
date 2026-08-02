@@ -1,0 +1,299 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+DEFAULT_TARGETS=(
+  "/Users/dale/conductor/workspaces/x10.oh.cowork/route-session-through-app"
+)
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+SPEC_KIT_DIR="${SPEC_KIT_DIR:-$SCRIPT_DIR}"
+TARGETS=("${DEFAULT_TARGETS[@]}")
+TARGETS_FROM_CLI=0
+INTEGRATION_OVERRIDE="${APPLY_SPECKIT_INTEGRATION:-}"
+INTEGRATION_OPTIONS="${APPLY_SPECKIT_INTEGRATION_OPTIONS:-}"
+SCRIPT_TYPE_OVERRIDE="${APPLY_SPECKIT_SCRIPT:-}"
+FORCE=1
+DRY_RUN=0
+
+build_dir=""
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./apply-new-speckit [TARGET...] [options]
+
+Build this Spec Kit checkout into a temporary wheel and apply it to one or more projects.
+
+Defaults:
+  targets     DEFAULT_TARGETS in this script
+  integration Detected per target from .specify/integration.json, then init-options.json, then codex
+  script      Detected per target from .specify/init-options.json, then sh
+  force       Enabled for integration upgrades
+
+Options:
+  --target PATH                 Project to update; repeatable
+  --integration KEY             Integration to install/upgrade for every target
+  --integration-options TEXT    Options passed to specify, for example "--skills"
+  --script sh|ps                Script type to install for every target
+  --force                       Overwrite managed Spec Kit files during upgrade (default)
+  --no-force                    Let specify block if managed files changed locally
+  --dry-run                     Print commands without running them
+  -h, --help                    Show this help
+
+Environment:
+  APPLY_SPECKIT_TARGETS         Newline-delimited target list
+  APPLY_SPECKIT_TARGET          Single target override, kept for compatibility
+
+Examples:
+  ./apply-new-speckit
+  ./apply-new-speckit --no-force
+  ./apply-new-speckit /path/to/project-a /path/to/project-b --integration codex
+  ./apply-new-speckit --integration copilot --integration-options "--skills"
+EOF
+}
+
+cleanup() {
+  if [[ -n "${build_dir:-}" && -d "$build_dir" ]]; then
+    rm -rf "$build_dir"
+  fi
+}
+trap cleanup EXIT
+
+log() {
+  printf '==> %s\n' "$*"
+}
+
+die() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 1
+}
+
+add_target() {
+  if (( ! TARGETS_FROM_CLI )); then
+    TARGETS=()
+    TARGETS_FROM_CLI=1
+  fi
+  TARGETS+=("$1")
+}
+
+set_targets_from_lines() {
+  local raw=$1
+  local line
+
+  TARGETS=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && TARGETS+=("$line")
+  done <<< "$raw"
+}
+
+quote_cmd() {
+  local arg
+  for arg in "$@"; do
+    printf '%q ' "$arg"
+  done
+  printf '\n'
+}
+
+run() {
+  printf '+ '
+  quote_cmd "$@"
+  if (( DRY_RUN )); then
+    return 0
+  fi
+  "$@"
+}
+
+run_in_target() {
+  local target_root=$1
+  shift
+
+  printf '+ cd %q && ' "$target_root"
+  quote_cmd "$@"
+  if (( DRY_RUN )); then
+    return 0
+  fi
+  (cd "$target_root" && "$@")
+}
+
+json_get_string() {
+  local file=$1
+  shift
+
+  python3 - "$file" "$@" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+keys = sys.argv[2:]
+
+try:
+    with open(path, encoding="utf-8") as handle:
+        value = json.load(handle)
+    for key in keys:
+        if not isinstance(value, dict):
+            raise KeyError(key)
+        value = value[key]
+except Exception:
+    sys.exit(1)
+
+if isinstance(value, str) and value:
+    print(value)
+else:
+    sys.exit(1)
+PY
+}
+
+if [[ ${APPLY_SPECKIT_TARGETS:-} ]]; then
+  set_targets_from_lines "$APPLY_SPECKIT_TARGETS"
+elif [[ ${APPLY_SPECKIT_TARGET:-} ]]; then
+  TARGETS=("$APPLY_SPECKIT_TARGET")
+fi
+
+while (($#)); do
+  case "$1" in
+    --target)
+      [[ $# -ge 2 ]] || die "--target requires a path"
+      add_target "$2"
+      shift 2
+      ;;
+    --integration)
+      [[ $# -ge 2 ]] || die "--integration requires a key"
+      INTEGRATION_OVERRIDE=$2
+      shift 2
+      ;;
+    --integration-options)
+      [[ $# -ge 2 ]] || die "--integration-options requires a value"
+      INTEGRATION_OPTIONS=$2
+      shift 2
+      ;;
+    --script)
+      [[ $# -ge 2 ]] || die "--script requires sh or ps"
+      SCRIPT_TYPE_OVERRIDE=$2
+      shift 2
+      ;;
+    --force)
+      FORCE=1
+      shift
+      ;;
+    --no-force)
+      FORCE=0
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      die "unknown option: $1"
+      ;;
+    *)
+      add_target "$1"
+      shift
+      ;;
+  esac
+done
+
+command -v uv >/dev/null 2>&1 || die "uv is required. Install it first: https://docs.astral.sh/uv/"
+command -v python3 >/dev/null 2>&1 || die "python3 is required to read Spec Kit project metadata"
+
+[[ -d "$SPEC_KIT_DIR" ]] || die "Spec Kit checkout not found: $SPEC_KIT_DIR"
+[[ -f "$SPEC_KIT_DIR/pyproject.toml" ]] || die "pyproject.toml not found in: $SPEC_KIT_DIR"
+[[ ${#TARGETS[@]} -gt 0 ]] || die "no target projects configured"
+
+TARGET_ROOTS=()
+for target in "${TARGETS[@]}"; do
+  [[ -d "$target" ]] || die "target directory not found: $target"
+  TARGET_ROOTS+=("$(cd "$target" && pwd -P)")
+done
+
+log "Spec Kit checkout: $SPEC_KIT_DIR"
+log "Target projects: ${#TARGET_ROOTS[@]}"
+
+build_dir="$(mktemp -d "${TMPDIR:-/tmp}/speckit-build.XXXXXX")"
+run uv build --wheel --out-dir "$build_dir" "$SPEC_KIT_DIR"
+
+if (( DRY_RUN )); then
+  wheel="$build_dir/specify_cli-*.whl"
+else
+  shopt -s nullglob
+  wheels=("$build_dir"/specify_cli-*.whl)
+  shopt -u nullglob
+  [[ ${#wheels[@]} -eq 1 ]] || die "expected one built wheel, found ${#wheels[@]} in $build_dir"
+  wheel="${wheels[0]}"
+fi
+
+SPECIFY_CMD=(uv tool run --isolated --from "$wheel" specify)
+
+log "Using wheel: $wheel"
+run "${SPECIFY_CMD[@]}" version
+
+apply_to_target() {
+  local target_root=$1
+  local init_options="$target_root/.specify/init-options.json"
+  local integration_state="$target_root/.specify/integration.json"
+  local integration="$INTEGRATION_OVERRIDE"
+  local script_type="$SCRIPT_TYPE_OVERRIDE"
+  local apply_args
+
+  if [[ -z "$integration" ]]; then
+    integration="$(json_get_string "$integration_state" default_integration 2>/dev/null || true)"
+  fi
+  if [[ -z "$integration" ]]; then
+    integration="$(json_get_string "$integration_state" integration 2>/dev/null || true)"
+  fi
+  if [[ -z "$integration" ]]; then
+    integration="$(json_get_string "$init_options" integration 2>/dev/null || true)"
+  fi
+  if [[ -z "$integration" ]]; then
+    integration="$(json_get_string "$init_options" ai 2>/dev/null || true)"
+  fi
+  if [[ -z "$integration" ]]; then
+    integration="codex"
+  fi
+
+  if [[ -z "$script_type" ]]; then
+    script_type="$(json_get_string "$init_options" script 2>/dev/null || true)"
+  fi
+  if [[ -z "$script_type" ]]; then
+    script_type="sh"
+  fi
+
+  case "$script_type" in
+    sh|ps) ;;
+    *) die "--script must be sh or ps, got: $script_type" ;;
+  esac
+
+  log "Target project: $target_root"
+  log "Integration: $integration"
+  log "Script type: $script_type"
+
+  if [[ -d "$target_root/.specify" ]]; then
+    apply_args=(integration upgrade "$integration" --script "$script_type")
+  else
+    apply_args=(init --here --integration "$integration" --script "$script_type")
+  fi
+
+  if (( FORCE )); then
+    apply_args+=(--force)
+  fi
+
+  if [[ -n "$INTEGRATION_OPTIONS" ]]; then
+    apply_args+=(--integration-options "$INTEGRATION_OPTIONS")
+  fi
+
+  run_in_target "$target_root" "${SPECIFY_CMD[@]}" "${apply_args[@]}"
+}
+
+for target_root in "${TARGET_ROOTS[@]}"; do
+  apply_to_target "$target_root"
+done
+
+log "Done"
